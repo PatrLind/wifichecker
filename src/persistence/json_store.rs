@@ -20,6 +20,29 @@ pub fn drawings_dir() -> PathBuf {
     config_dir().join("drawings")
 }
 
+/// Returns the directory that holds the freehand drawings of the project
+/// stored at `project_path`.
+///
+/// The default project keeps its historical location
+/// `~/.config/wifichecker/drawings/`. Any other project stores its drawings
+/// in a `drawings/` subdirectory next to the project file, so a project and
+/// its drawings can be moved together.
+pub fn drawings_dir_for(project_path: &Path) -> PathBuf {
+    let is_default = project_path == JsonStore::default_path()
+        || matches!(
+            (project_path.canonicalize(), JsonStore::default_path().canonicalize()),
+            (Ok(a), Ok(b)) if a == b
+        );
+    if is_default {
+        return config_dir().join("drawings");
+    }
+    project_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.join("drawings"))
+        .unwrap_or_else(|| config_dir().join("drawings"))
+}
+
 /// Ensures config dir and drawings subdir exist.
 pub fn ensure_config_dirs() -> Result<()> {
     std::fs::create_dir_all(drawings_dir())
@@ -72,6 +95,20 @@ mod tests {
     fn test_drawings_dir_ends_with_drawings() {
         let dir = drawings_dir();
         assert!(dir.ends_with("drawings"));
+    }
+
+    #[test]
+    fn test_drawings_dir_for_default_path() {
+        let dir = drawings_dir_for(&JsonStore::default_path());
+        assert_eq!(dir, config_dir().join("drawings"));
+    }
+
+    #[test]
+    fn test_drawings_dir_for_external_path() {
+        let path = std::env::temp_dir()
+            .join(format!("wifichecker_extproj_{}_project.json", std::process::id()));
+        let dir = drawings_dir_for(&path);
+        assert_eq!(dir, path.parent().unwrap().join("drawings"));
     }
 
     #[test]

@@ -29,6 +29,7 @@
 - **Calibration** — set a real-world scale by clicking two known points and entering the distance in metres
 - **Snap-to-grid** — configurable measurement grid with optional snap for consistent coverage
 - **Zoom & pan** — scroll-wheel zoom (cursor-centred) plus zoom in/out/reset buttons
+- **Project files** — start new projects, open existing ones, or save-as to any location from the project menu
 - **Auto-save** — project, drawings, and settings persist automatically to `~/.config/wifichecker/`
 
 ---
@@ -133,7 +134,7 @@ Both tests run in the background alongside every WiFi scan and their results are
 
 ## Data storage
 
-All data is stored under `~/.config/wifichecker/`:
+The default project and app settings are stored under `~/.config/wifichecker/`:
 
 ```
 ~/.config/wifichecker/
@@ -144,6 +145,22 @@ All data is stored under `~/.config/wifichecker/`:
     ├── floor_1.png
     └── ...
 ```
+
+**Saving a project elsewhere.** The project menu (top right) offers *New Project*,
+*Open Project…* and *Save Project As…*. A project saved to a non-default location
+keeps its drawing files in a `drawings/` subdirectory next to the project file,
+so the two travel together:
+
+```
+/path/to/office.json      # project
+/path/to/drawings/
+├── floor_0.png
+└── floor_1.png
+```
+
+When a project file is opened, its drawings are copied into that project's own
+drawings directory (if they are not already there), so a copied or moved project
+file remains self-contained.
 
 ---
 

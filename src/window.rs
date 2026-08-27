@@ -1,17 +1,19 @@
 use gtk4::prelude::*;
 use gtk4::{
     Box as GtkBox, Button, DropDown, FileDialog,
-    Orientation, Separator, StringList, ToggleButton,
+    MenuButton, Orientation, Separator, StringList, ToggleButton,
 };
 use gtk4::glib;
+use gtk4::gio::prelude::ActionMapExt;
 use libadwaita::prelude::*;
 use libadwaita::{ApplicationWindow, HeaderBar, MessageDialog, Toast, ToastOverlay};
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use crate::models::{AppSettings, Floor, Measurement, Project};
 use crate::persistence::{JsonStore, SettingsStore};
-use crate::persistence::json_store::{drawings_dir, ensure_config_dirs};
+use crate::persistence::json_store::{drawings_dir_for, ensure_config_dirs};
 use crate::services::{IperfClient, SmbTester, WifiInfo, WifiScanner};
 use crate::widgets::{FloorPlanView, LegendBar, MeasurementPanel, SettingsDialog};
 use crate::widgets::floor_plan_view::DrawMode;
@@ -45,9 +47,12 @@ impl Window {
         let project = JsonStore::load(&JsonStore::default_path())
             .unwrap_or_else(|_| Project::new("My Project"));
 
+        window.set_title(Some(&format!("{} — WiFi Checker", project.name)));
+
         let state = Rc::new(RefCell::new(AppState {
             project,
             current_floor: 0,
+            project_path: JsonStore::default_path(),
         }));
 
         let content = build_ui(&window, state.clone(), settings.clone());
@@ -76,12 +81,21 @@ impl Window {
 struct AppState {
     project: Project,
     current_floor: usize,
+    /// File that the current project auto-saves to.
+    project_path: PathBuf,
 }
 
-/// Save the current floor's canvas PNG and persist the whole project to disk.
+/// Save the current floor's canvas PNG and persist the whole project to its file.
 fn auto_save(fp: &FloorPlanView, state: &Rc<RefCell<AppState>>) {
-    let idx = state.borrow().current_floor;
-    let canvas_path = drawings_dir().join(format!("floor_{idx}.png"));
+    let (idx, project_path) = {
+        let s = state.borrow();
+        (s.current_floor, s.project_path.clone())
+    };
+    let canvas_dir = drawings_dir_for(&project_path);
+    if let Err(e) = std::fs::create_dir_all(&canvas_dir) {
+        log::warn!("Failed to create drawings dir {}: {e}", canvas_dir.display());
+    }
+    let canvas_path = canvas_dir.join(format!("floor_{idx}.png"));
     if fp.save_canvas(&canvas_path).is_ok() {
         let mut s = state.borrow_mut();
         if let Some(floor) = s.project.floors.get_mut(idx) {
@@ -90,7 +104,108 @@ fn auto_save(fp: &FloorPlanView, state: &Rc<RefCell<AppState>>) {
         }
     }
     let project = state.borrow().project.clone();
-    let _ = JsonStore::save(&project, &JsonStore::default_path());
+    let _ = JsonStore::save(&project, &project_path);
+}
+
+/// Load a floor's data (image, canvas, calibration, measurements) into the
+/// floor-plan view, legend bar, and measurement panel.
+fn load_floor_into_view(
+    fp: &FloorPlanView,
+    legend: &LegendBar,
+    panel: &MeasurementPanel,
+    floor: &Floor,
+) {
+    fp.set_image("");
+    fp.clear_canvas();
+    fp.clear_calibration();
+    if let Some(ref p) = floor.image_path {
+        if p.to_lowercase().ends_with(".pdf") {
+            fp.set_pdf(p, floor.pdf_page.unwrap_or(0));
+        } else {
+            fp.set_image(p);
+        }
+    }
+    if let Some(ref p) = floor.drawing_path {
+        fp.load_canvas(std::path::Path::new(p));
+    }
+    if let (Some(sc), Some(a), Some(b)) = (floor.scale_px_per_m, floor.calib_point_a, floor.calib_point_b) {
+        fp.set_scale(sc, a, b);
+    }
+    fp.set_origin(floor.origin);
+    fp.set_measurements(floor.measurements.clone());
+    legend.set_measurements(&floor.measurements);
+    panel.set_measurements(floor.measurements.clone());
+}
+
+/// Return a copy of `project` whose drawing files are guaranteed to live in
+/// `drawings_dir`: existing drawings are copied there and the references are
+/// rewritten. This lets a project file and its drawings travel together.
+fn independent_project_copy(project: &Project, drawings_dir: &std::path::Path) -> Project {
+    let mut out = project.clone();
+    let _ = std::fs::create_dir_all(drawings_dir);
+    for (i, floor) in out.floors.iter_mut().enumerate() {
+        let Some(ref p) = floor.drawing_path else { continue; };
+        let src = std::path::Path::new(p);
+        if !src.exists() { continue; }
+        let dst = drawings_dir.join(format!("floor_{i}.png"));
+        // Already stored in this project's drawings dir — just fix up the ref
+        if let (Ok(a), Ok(b)) = (src.canonicalize(), drawings_dir.canonicalize()) {
+            if a == b || a.starts_with(&b) {
+                floor.drawing_path = Some(dst.to_string_lossy().to_string());
+                continue;
+            }
+        }
+        match std::fs::copy(src, &dst) {
+            Ok(_) => floor.drawing_path = Some(dst.to_string_lossy().to_string()),
+            Err(e) => log::warn!("Failed to copy drawing {} → {}: {e}", src.display(), dst.display()),
+        }
+    }
+    out
+}
+
+/// Replace the in-memory project and refresh every UI element to match it.
+/// Returns the project name.
+fn apply_project(
+    state: &Rc<RefCell<AppState>>,
+    fp: &FloorPlanView,
+    legend: &LegendBar,
+    panel: &MeasurementPanel,
+    floor_model: &StringList,
+    floor_dropdown: &DropDown,
+    suppress: &Rc<std::cell::Cell<bool>>,
+    settings: &Rc<RefCell<AppSettings>>,
+    project: Project,
+    project_path: PathBuf,
+) -> String {
+    let mut project = project;
+    if project.floors.is_empty() {
+        project.add_floor(Floor::new("Floor 1"));
+    }
+    // Make sure the project's drawing files travel with the project file
+    let project = independent_project_copy(&project, &drawings_dir_for(&project_path));
+
+    let (names, start_floor, old_count) = {
+        let mut s = state.borrow_mut();
+        let old_count = s.project.floors.len();
+        s.project = project;
+        s.project_path = project_path.clone();
+        s.current_floor = 0;
+        let names = s.project.floors.iter().map(|f| f.name.clone()).collect::<Vec<_>>();
+        (names, s.project.floors[0].clone(), old_count)
+    };
+
+    settings.borrow_mut().last_floor_index = 0;
+    let _ = SettingsStore::save(&settings.borrow());
+
+    // Rebuild the floor dropdown without triggering selected_notify side-effects
+    suppress.set(true);
+    let name_refs: Vec<&str> = names.iter().map(|n| n.as_str()).collect();
+    floor_model.splice(0, old_count as u32, &name_refs);
+    floor_dropdown.set_selected(0);
+    suppress.set(false);
+
+    load_floor_into_view(fp, legend, panel, &start_floor);
+    state.borrow().project.name.clone()
 }
 
 fn build_ui(
@@ -103,6 +218,18 @@ fn build_ui(
 
     // ── Header bar ────────────────────────────────────────────────────────────
     let header = HeaderBar::new();
+
+    // Project menu (hamburger). Actions are wired up further down, once all
+    // the widgets they touch exist.
+    let project_menu = gtk4::gio::Menu::new();
+    project_menu.append(Some("New Project"), Some("win.new-project"));
+    project_menu.append(Some("Open Project…"), Some("win.open-project"));
+    project_menu.append(Some("Save Project As…"), Some("win.save-project-as"));
+    let menu_btn = MenuButton::new();
+    menu_btn.set_icon_name("open-menu-symbolic");
+    menu_btn.set_tooltip_text(Some("Project: new / open / save as"));
+    menu_btn.set_menu_model(Some(&project_menu));
+    header.pack_end(&menu_btn);
 
     let floor_model = StringList::new(&[]);
     let floor_dropdown = DropDown::new(Some(floor_model.clone()), gtk4::Expression::NONE);
@@ -732,39 +859,8 @@ fn build_ui(
                         suppress2.set(false);
 
                         // Load the replacement floor into the UI
-                        let (measurements, image_path, drawing_path, scale, calib_a, calib_b, pdf_page, origin) = {
-                            let s = state2.borrow();
-                            let floor = &s.project.floors[new_idx];
-                            (
-                                floor.measurements.clone(),
-                                floor.image_path.clone(),
-                                floor.drawing_path.clone(),
-                                floor.scale_px_per_m,
-                                floor.calib_point_a,
-                                floor.calib_point_b,
-                                floor.pdf_page,
-                                floor.origin,
-                            )
-                        };
-
-                        fp2.set_image("");
-                        fp2.clear_canvas();
-                        fp2.clear_calibration();
-                        if let Some(ref p) = image_path {
-                            if p.to_lowercase().ends_with(".pdf") {
-                                fp2.set_pdf(p, pdf_page.unwrap_or(0));
-                            } else {
-                                fp2.set_image(p);
-                            }
-                        }
-                        if let Some(p) = drawing_path { fp2.load_canvas(std::path::Path::new(&p)); }
-                        if let (Some(sc), Some(a), Some(b)) = (scale, calib_a, calib_b) {
-                            fp2.set_scale(sc, a, b);
-                        }
-                        fp2.set_origin(origin);
-                        fp2.set_measurements(measurements.clone());
-                        legend2.set_measurements(&measurements);
-                        panel2.set_measurements(measurements);
+                        let floor = state2.borrow().project.floors[new_idx].clone();
+                        load_floor_into_view(&fp2, &legend2, &panel2, &floor);
 
                         auto_save(&fp2, &state2);
                         overlay2.add_toast(Toast::new("Floor deleted"));
@@ -789,43 +885,15 @@ fn build_ui(
             // Auto-save the floor being left
             auto_save(&fp, &state);
 
-            let (measurements, image_path, drawing_path, scale, calib_a, calib_b, pdf_page, origin) = {
+            let floor = {
                 let mut s = state.borrow_mut();
                 if new_idx >= s.project.floors.len() { return; }
                 s.current_floor = new_idx;
                 settings.borrow_mut().last_floor_index = new_idx;
                 let _ = SettingsStore::save(&settings.borrow());
-                let floor = &s.project.floors[new_idx];
-                (
-                    floor.measurements.clone(),
-                    floor.image_path.clone(),
-                    floor.drawing_path.clone(),
-                    floor.scale_px_per_m,
-                    floor.calib_point_a,
-                    floor.calib_point_b,
-                    floor.pdf_page,
-                    floor.origin,
-                )
+                s.project.floors[new_idx].clone()
             };
-
-            fp.set_image("");
-            fp.clear_canvas();
-            fp.clear_calibration();
-            if let Some(ref p) = image_path {
-                if p.to_lowercase().ends_with(".pdf") {
-                    fp.set_pdf(p, pdf_page.unwrap_or(0));
-                } else {
-                    fp.set_image(p);
-                }
-            }
-            if let Some(p) = drawing_path { fp.load_canvas(std::path::Path::new(&p)); }
-            if let (Some(s), Some(a), Some(b)) = (scale, calib_a, calib_b) {
-                fp.set_scale(s, a, b);
-            }
-            fp.set_origin(origin);
-            fp.set_measurements(measurements.clone());
-            legend.set_measurements(&measurements);
-            panel.set_measurements(measurements);
+            load_floor_into_view(&fp, &legend, &panel, &floor);
         });
     }
 
@@ -929,10 +997,180 @@ fn build_ui(
         });
     }
 
+    // ── Project menu actions ────────────────────────────────────────────────
+    {
+        let win_actions = gtk4::gio::SimpleActionGroup::new();
+        let window_ref = window.clone();
+
+        // New project: keep the current one (it is auto-saved) and start fresh
+        let act_new = gtk4::gio::SimpleAction::new("new-project", None);
+        {
+            let state = state.clone();
+            let fp = floor_plan.clone();
+            let legend = legend.clone();
+            let panel = panel.clone();
+            let floor_model = floor_model.clone();
+            let floor_dd = floor_dropdown.clone();
+            let suppress = suppress_floor_change.clone();
+            let settings = settings.clone();
+            let overlay_ref = overlay.clone();
+            let window_ref2 = window_ref.clone();
+            act_new.connect_activate(move |_, _| {
+                let dialog = MessageDialog::builder()
+                    .heading("Start New Project")
+                    .body("The current project is saved at its current location and can be reopened from there.\n\nStart a new, empty project?")
+                    .default_response("new")
+                    .close_response("cancel")
+                    .transient_for(&window_ref2)
+                    .modal(true)
+                    .build();
+                dialog.add_response("cancel", "Cancel");
+                dialog.add_response("new", "New Project");
+                dialog.set_response_appearance("new", libadwaita::ResponseAppearance::Suggested);
+
+                let state2 = state.clone();
+                let fp2 = fp.clone();
+                let legend2 = legend.clone();
+                let panel2 = panel.clone();
+                let fm2 = floor_model.clone();
+                let dd2 = floor_dd.clone();
+                let suppress2 = suppress.clone();
+                let settings2 = settings.clone();
+                let overlay2 = overlay_ref.clone();
+                let window_ref3 = window_ref2.clone();
+                dialog.choose(gtk4::gio::Cancellable::NONE, move |response| {
+                    if response.as_str() != "new" { return; }
+                    // The current project stays saved at its current path
+                    auto_save(&fp2, &state2);
+                    let mut project = Project::new("New Project");
+                    project.add_floor(Floor::new("Floor 1"));
+                    let name = apply_project(
+                        &state2, &fp2, &legend2, &panel2, &fm2, &dd2, &suppress2, &settings2,
+                        project, JsonStore::default_path(),
+                    );
+                    window_ref3.set_title(Some(&format!("{name} — WiFi Checker")));
+                    overlay2.add_toast(Toast::new("New project started"));
+                });
+            });
+        }
+        ActionMapExt::add_action(&win_actions, &act_new);
+
+        // Open project: load a project file, replacing the current one
+        let act_open = gtk4::gio::SimpleAction::new("open-project", None);
+        {
+            let state = state.clone();
+            let fp = floor_plan.clone();
+            let legend = legend.clone();
+            let panel = panel.clone();
+            let floor_model = floor_model.clone();
+            let floor_dd = floor_dropdown.clone();
+            let suppress = suppress_floor_change.clone();
+            let settings = settings.clone();
+            let overlay_ref = overlay.clone();
+            let window_ref2 = window_ref.clone();
+            act_open.connect_activate(move |_, _| {
+                let dialog = FileDialog::builder().title("Open Project").modal(true).build();
+                let filter = gtk4::FileFilter::new();
+                filter.add_suffix("json");
+                filter.set_name(Some("WiFi Checker projects (JSON)"));
+                let filters = gtk4::gio::ListStore::new::<gtk4::FileFilter>();
+                filters.append(&filter);
+                dialog.set_filters(Some(&filters));
+
+                let state2 = state.clone();
+                let fp2 = fp.clone();
+                let legend2 = legend.clone();
+                let panel2 = panel.clone();
+                let fm2 = floor_model.clone();
+                let dd2 = floor_dd.clone();
+                let suppress2 = suppress.clone();
+                let settings2 = settings.clone();
+                let overlay2 = overlay_ref.clone();
+                let window_ref3 = window_ref2.clone();
+                let dialog_parent = window_ref2.clone();
+                dialog.open(Some(&dialog_parent), gtk4::gio::Cancellable::NONE, move |result| {
+                    let Ok(file) = result else { return; };
+                    let Some(path) = file.path() else { return; };
+
+                    let project = match JsonStore::load(&path) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            overlay2.add_toast(Toast::new(&format!("Failed to open project: {e}")));
+                            return;
+                        }
+                    };
+
+                    // Persist the project we are about to replace
+                    auto_save(&fp2, &state2);
+                    let name = apply_project(
+                        &state2, &fp2, &legend2, &panel2, &fm2, &dd2, &suppress2, &settings2,
+                        project, path,
+                    );
+                    window_ref3.set_title(Some(&format!("{name} — WiFi Checker")));
+                    overlay2.add_toast(Toast::new(&format!("Opened: {name}")));
+                });
+            });
+        }
+        ActionMapExt::add_action(&win_actions, &act_open);
+
+        // Save project as: write the project (with its drawings) to a new file
+        // and switch auto-save to that location
+        let act_save = gtk4::gio::SimpleAction::new("save-project-as", None);
+        {
+            let state = state.clone();
+            let fp = floor_plan.clone();
+            let overlay_ref = overlay.clone();
+            let window_ref2 = window_ref.clone();
+            act_save.connect_activate(move |_, _| {
+                let dialog = FileDialog::builder().title("Save Project As").modal(true).build();
+                let filter = gtk4::FileFilter::new();
+                filter.add_suffix("json");
+                filter.set_name(Some("WiFi Checker projects (JSON)"));
+                let filters = gtk4::gio::ListStore::new::<gtk4::FileFilter>();
+                filters.append(&filter);
+                dialog.set_filters(Some(&filters));
+
+                let state2 = state.clone();
+                let fp2 = fp.clone();
+                let overlay2 = overlay_ref.clone();
+                let dialog_parent = window_ref2.clone();
+                dialog.save(Some(&dialog_parent), gtk4::gio::Cancellable::NONE, move |result| {
+                    let Ok(file) = result else { return; };
+                    let Some(mut path) = file.path() else { return; };
+                    if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                        let stem = path.file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "project".to_string());
+                        path.set_file_name(format!("{stem}.json"));
+                    }
+
+                    let project = state2.borrow().project.clone();
+                    // Copy the project's drawing files next to the new project file
+                    let project = independent_project_copy(&project, &drawings_dir_for(&path));
+
+                    match JsonStore::save(&project, &path) {
+                        Ok(()) => {
+                            // From now on auto-save goes to the new location
+                            state2.borrow_mut().project_path = path.clone();
+                            auto_save(&fp2, &state2);
+                            overlay2.add_toast(Toast::new(&format!("Project saved to {}", path.display())));
+                        }
+                        Err(e) => {
+                            overlay2.add_toast(Toast::new(&format!("Failed to save project: {e}")));
+                        }
+                    }
+                });
+            });
+        }
+        ActionMapExt::add_action(&win_actions, &act_save);
+
+        window.insert_action_group("win", Some(&win_actions));
+    }
+
     // ── Initialize from loaded project ────────────────────────────────────────
     {
         // Collect all data needed, then release borrow before touching the model
-        let (floor_names, start_floor_data, start_idx) = {
+        let (floor_names, start_floor, start_idx) = {
             let mut s = state.borrow_mut();
             if s.project.floors.is_empty() {
                 s.project.add_floor(Floor::new("Floor 1"));
@@ -941,17 +1179,8 @@ fn build_ui(
             let start_idx = if last_idx < s.project.floors.len() { last_idx } else { 0 };
             s.current_floor = start_idx;
             let names: Vec<String> = s.project.floors.iter().map(|f| f.name.clone()).collect();
-            let first = s.project.floors.get(start_idx).map(|f| (
-                f.measurements.clone(),
-                f.image_path.clone(),
-                f.drawing_path.clone(),
-                f.scale_px_per_m,
-                f.calib_point_a,
-                f.calib_point_b,
-                f.pdf_page,
-                f.origin,
-            ));
-            (names, first, start_idx)
+            let start = s.project.floors.get(start_idx).cloned();
+            (names, start, start_idx)
         }; // state borrow fully released here
 
         // Suppress all notifications during bulk initialization to prevent premature
@@ -964,26 +1193,8 @@ fn build_ui(
         suppress_floor_change.set(false);
 
         // Load restored floor into view
-        if let Some((measurements, image_path, drawing_path, scale, calib_a, calib_b, pdf_page, origin)) = start_floor_data {
-            if let Some(ref p) = image_path {
-                if p.to_lowercase().ends_with(".pdf") {
-                    floor_plan.set_pdf(p, pdf_page.unwrap_or(0));
-                } else {
-                    floor_plan.set_image(p);
-                }
-            }
-            if let Some(p) = drawing_path { floor_plan.load_canvas(std::path::Path::new(&p)); }
-            if let (Some(sc), Some(a), Some(b)) = (scale, calib_a, calib_b) {
-                floor_plan.set_scale(sc, a, b);
-            }
-            floor_plan.set_origin(origin);
-            floor_plan.set_measurements(measurements.clone());
-            legend.set_measurements(&measurements);
-            panel.set_measurements(measurements);
-        } else {
-            floor_plan.set_measurements(vec![]);
-            legend.set_measurements(&[]);
-            panel.set_measurements(vec![]);
+        if let Some(floor) = start_floor {
+            load_floor_into_view(&floor_plan, &legend, &panel, &floor);
         }
     }
 
@@ -1084,4 +1295,59 @@ fn show_pdf_page_picker(
     }
 
     dialog.present();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir()
+            .join(format!("wifichecker_window_test_{}_{}", std::process::id(), tag))
+    }
+
+    #[test]
+    fn test_independent_copy_migrates_drawings() {
+        let dir = temp_dir("migrate");
+        let src_dir = dir.join("src_drawings");
+        let dst_dir = dir.join("dst_drawings");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("floor_0.png"), b"fake-png").unwrap();
+
+        let mut floor0 = Floor::new("L0");
+        floor0.drawing_path = Some(src_dir.join("floor_0.png").to_string_lossy().to_string());
+        let mut project = Project::new("Test");
+        project.add_floor(floor0);
+        project.add_floor(Floor::new("L1"));
+
+        let out = independent_project_copy(&project, &dst_dir);
+        let expected = dst_dir.join("floor_0.png").to_string_lossy().to_string();
+        assert_eq!(out.floors[0].drawing_path.as_deref(), Some(expected.as_str()));
+        assert!(dst_dir.join("floor_0.png").exists());
+        // Floor without a drawing is untouched
+        assert!(out.floors[1].drawing_path.is_none());
+
+        // Idempotent: a second run keeps the reference stable
+        let out2 = independent_project_copy(&out, &dst_dir);
+        assert_eq!(out2.floors[0].drawing_path, out.floors[0].drawing_path);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_independent_copy_missing_source_keeps_reference() {
+        let dir = temp_dir("missing");
+        let dst_dir = dir.join("dst_drawings");
+        std::fs::create_dir_all(&dst_dir).unwrap();
+
+        let mut floor0 = Floor::new("L0");
+        floor0.drawing_path = Some(dir.join("gone").join("floor_0.png").to_string_lossy().to_string());
+        let mut project = Project::new("Test");
+        project.add_floor(floor0);
+
+        let out = independent_project_copy(&project, &dst_dir);
+        assert_eq!(out.floors[0].drawing_path, project.floors[0].drawing_path);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
