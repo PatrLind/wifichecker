@@ -31,7 +31,8 @@ impl LegendBar {
         let area = DrawingArea::new();
         area.set_height_request(52);
         area.set_hexpand(true);
-        area.set_visible(false);
+        // The legend is always shown, even when there are no measurements.
+        area.set_visible(true);
 
         let state = Rc::new(RefCell::new(LegendState {
             metric: ColorMetric::SignalDbm,
@@ -67,12 +68,13 @@ impl LegendBar {
         Self { widget: area, state }
     }
 
-    pub fn set_measurements(&self, measurements: &[Measurement]) {
-        let active = !measurements.is_empty();
+    pub fn set_measurements(&self, _measurements: &[Measurement]) {
+        // The legend is always visible (it shows the fixed reference scale for
+        // the current metric, independent of whether measurements exist).
         let mut s = self.state.borrow_mut();
-        s.active = active;
+        s.active = true;
         drop(s);
-        self.widget.set_visible(active);
+        self.widget.set_visible(true);
         self.widget.queue_draw();
     }
 
