@@ -51,6 +51,10 @@ pub struct AppSettings {
     pub grid_spacing_m: f64,        // visual grid line spacing
     pub measurement_grid_spacing_m: f64, // cell size for snapping & cell coloring
     pub snap_to_grid: bool,
+    /// Show the origin (0,0) marker on the map.
+    pub show_origin: bool,
+    /// Show the calibration/scale line (A–B + distance) on the map.
+    pub show_scale: bool,
 
     // Display
     pub throughput_unit: ThroughputUnit,
@@ -80,6 +84,8 @@ impl Default for AppSettings {
             grid_spacing_m: 1.0,
             measurement_grid_spacing_m: 1.0,
             snap_to_grid: false,
+            show_origin: true,
+            show_scale: true,
 
             throughput_unit: ThroughputUnit::Mbit,
             color_metric: ColorMetric::default(),

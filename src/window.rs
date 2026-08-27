@@ -289,37 +289,12 @@ fn apply_project(
     state.borrow().project.name.clone()
 }
 
-/// Register the custom "normal mouse arrow" symbolic icon used by the
-/// Select tool. The SVG is written to a temp dir that is added to the icon
-/// search path (in the standard icon-theme sub-directories), so the arrow
-/// recolours with the active colour scheme.
-fn register_custom_icons() {
-    const SELECT_ICON_SVG: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><path d="M 3 1.5 L 3 12 L 5.8 9.4 L 7.4 13.4 L 9.2 12.6 L 7.6 8.7 L 11.2 8.7 Z" fill="black"/></svg>"#;
-    let base = std::env::temp_dir().join("wifichecker-icons");
-    // Standard icon-theme sub-directories so GtkIconTheme finds it at any size.
-    let subs = [
-        "scalable/actions",
-        "16x16/actions", "24x24/actions", "32x32/actions",
-        "48x48/actions", "64x64/actions",
-    ];
-    for sub in subs {
-        let d = base.join(sub);
-        if std::fs::create_dir_all(&d).is_err() {
-            continue;
-        }
-        let _ = std::fs::write(d.join("select-cursor-symbolic.svg"), SELECT_ICON_SVG);
-    }
-    if let Some(display) = gtk4::gdk::Display::default() {
-        gtk4::IconTheme::for_display(&display).add_search_path(&base);
-    }
-}
 
 fn build_ui(
     window: &ApplicationWindow,
     state: Rc<RefCell<AppState>>,
     settings: Rc<RefCell<AppSettings>>,
 ) -> ToastOverlay {
-    register_custom_icons();
     let overlay = ToastOverlay::new();
     let main_box = GtkBox::new(Orientation::Vertical, 0);
 
@@ -391,8 +366,13 @@ fn build_ui(
         .group(&mode_measure)
         .build();
     let mode_select = ToggleButton::builder()
-        .icon_name("select-cursor-symbolic")
+        .icon_name("cursor-arrow-symbolic")
         .tooltip_text("Select mode (click a point to inspect a measurement)")
+        .group(&mode_measure)
+        .build();
+    let mode_ruler = ToggleButton::builder()
+        .icon_name("measure-symbolic")
+        .tooltip_text("Ruler (click two points to measure the distance between them)")
         .group(&mode_measure)
         .build();
 
@@ -405,6 +385,17 @@ fn build_ui(
         .icon_name("view-grid-symbolic")
         .tooltip_text("Toggle grid")
         .active(settings.borrow().show_grid)
+        .build();
+
+    let origin_toggle = ToggleButton::builder()
+        .icon_name("crosshairs-symbolic")
+        .tooltip_text("Show/hide the origin (0, 0) marker")
+        .active(settings.borrow().show_origin)
+        .build();
+    let scale_toggle = ToggleButton::builder()
+        .icon_name("view-reveal-symbolic")
+        .tooltip_text("Show/hide the calibration scale line")
+        .active(settings.borrow().show_scale)
         .build();
 
     // Grid spacing selector
@@ -439,11 +430,14 @@ fn build_ui(
     draw_bar.append(&mode_draw);
     draw_bar.append(&mode_calib);
     draw_bar.append(&mode_origin);
+    draw_bar.append(&mode_ruler);
     draw_bar.append(&Separator::new(Orientation::Vertical));
     draw_bar.append(&clear_canvas_btn);
     draw_bar.append(&Separator::new(Orientation::Vertical));
     draw_bar.append(&grid_toggle);
     draw_bar.append(&grid_spacing_dd);
+    draw_bar.append(&origin_toggle);
+    draw_bar.append(&scale_toggle);
     draw_bar.append(&Separator::new(Orientation::Vertical));
     draw_bar.append(&import_btn);
     draw_bar.append(&Separator::new(Orientation::Vertical));
@@ -462,6 +456,8 @@ fn build_ui(
     floor_plan.set_grid_spacing(settings.borrow().grid_spacing_m);
     floor_plan.set_measurement_grid_spacing(settings.borrow().measurement_grid_spacing_m);
     floor_plan.set_snap_to_grid(settings.borrow().snap_to_grid);
+    floor_plan.set_show_origin(settings.borrow().show_origin);
+    floor_plan.set_show_scale(settings.borrow().show_scale);
     floor_plan.set_color_metric(settings.borrow().color_metric);
 
     let legend = LegendBar::new();
@@ -537,6 +533,12 @@ fn build_ui(
             if btn.is_active() { fp.set_draw_mode(DrawMode::Select); }
         });
     }
+    {
+        let fp = floor_plan.clone();
+        mode_ruler.connect_toggled(move |btn| {
+            if btn.is_active() { fp.set_draw_mode(DrawMode::Ruler); }
+        });
+    }
 
     // Clear canvas
     {
@@ -564,6 +566,28 @@ fn build_ui(
         grid_toggle.connect_toggled(move |btn| {
             fp.set_show_grid(btn.is_active());
             settings.borrow_mut().show_grid = btn.is_active();
+            let _ = SettingsStore::save(&settings.borrow());
+        });
+    }
+
+    // Origin marker visibility toggle (persisted).
+    {
+        let fp = floor_plan.clone();
+        let settings = settings.clone();
+        origin_toggle.connect_toggled(move |btn| {
+            fp.set_show_origin(btn.is_active());
+            settings.borrow_mut().show_origin = btn.is_active();
+            let _ = SettingsStore::save(&settings.borrow());
+        });
+    }
+
+    // Scale line visibility toggle (persisted).
+    {
+        let fp = floor_plan.clone();
+        let settings = settings.clone();
+        scale_toggle.connect_toggled(move |btn| {
+            fp.set_show_scale(btn.is_active());
+            settings.borrow_mut().show_scale = btn.is_active();
             let _ = SettingsStore::save(&settings.borrow());
         });
     }
@@ -1296,12 +1320,16 @@ fn build_ui(
         let window_ref = window.clone();
         let fp = floor_plan.clone();
         let grid_toggle = grid_toggle.clone();
+        let origin_toggle = origin_toggle.clone();
+        let scale_toggle = scale_toggle.clone();
         let panel_ref = panel.clone();
         let legend_ref = legend.clone();
         settings_btn.connect_clicked(move |_| {
             let dlg = SettingsDialog::new(&window_ref, settings.clone());
             let fp2 = fp.clone();
             let grid_toggle2 = grid_toggle.clone();
+            let origin_toggle2 = origin_toggle.clone();
+            let scale_toggle2 = scale_toggle.clone();
             let settings2 = settings.clone();
             let panel2 = panel_ref.clone();
             let legend2 = legend_ref.clone();
@@ -1311,8 +1339,12 @@ fn build_ui(
                 fp2.set_grid_spacing(s.grid_spacing_m);
                 fp2.set_measurement_grid_spacing(s.measurement_grid_spacing_m);
                 fp2.set_snap_to_grid(s.snap_to_grid);
+                fp2.set_show_origin(s.show_origin);
+                fp2.set_show_scale(s.show_scale);
                 fp2.set_color_metric(s.color_metric);
                 grid_toggle2.set_active(s.show_grid);
+                origin_toggle2.set_active(s.show_origin);
+                scale_toggle2.set_active(s.show_scale);
                 panel2.set_throughput_unit(s.throughput_unit);
                 legend2.set_color_metric(s.color_metric);
                 gtk4::glib::Propagation::Proceed

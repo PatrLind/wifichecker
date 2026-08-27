@@ -22,6 +22,8 @@ pub enum DrawMode {
     SetOrigin,
     /// Click to inspect/select an existing measurement
     Select,
+    /// Click two points to measure the distance between them (ruler)
+    Ruler,
 }
 
 #[derive(Clone)]
@@ -58,6 +60,10 @@ struct FloorPlanState {
     // Origin (0,0) marker
     origin: Option<(f64, f64)>,  // relative coords
 
+    // Ruler: two points for a distance measurement (transient, not persisted).
+    ruler_a: Option<(f64, f64)>,  // relative coords
+    ruler_b: Option<(f64, f64)>,  // relative coords
+
     // Currently selected measurement (for inspect/correlation); transient,
     // not persisted.
     selected_measurement_id: Option<String>,
@@ -73,6 +79,10 @@ struct FloorPlanState {
     grid_spacing_m: f64,             // visual grid line spacing
     measurement_grid_spacing_m: f64, // cell size for snapping & coloring
     snap_to_grid: bool,
+    /// Show the origin (0,0) marker (forced on while in SetOrigin mode).
+    show_origin: bool,
+    /// Show the calibration/scale line (forced on while in Calibrate mode).
+    show_scale: bool,
 
     // Zoom / pan
     zoom: f64,
@@ -138,6 +148,8 @@ impl FloorPlanView {
             calib_b: None,
             scale_px_per_m: None,
             origin: None,
+            ruler_a: None,
+            ruler_b: None,
             selected_measurement_id: None,
             pending_measurement: None,
             pending_pulse_phase: 0.0,
@@ -145,6 +157,8 @@ impl FloorPlanView {
             grid_spacing_m: 1.0,
             measurement_grid_spacing_m: 1.0,
             snap_to_grid: false,
+            show_origin: true,
+            show_scale: true,
             hover_pos: None,
             hover_cell: None,
             tooltip_visible: false,
@@ -288,6 +302,21 @@ impl FloorPlanView {
                         drop(s);
                         if let Some(cb) = cb {
                             cb(id);
+                        }
+                    }
+                    DrawMode::Ruler => {
+                        let (cx, cy) = widget_to_canvas(&s, x, y);
+                        let rx = cx / mw;
+                        let ry = cy / mh;
+                        if s.ruler_a.is_none() {
+                            s.ruler_a = Some((rx, ry));
+                            s.ruler_b = None;
+                        } else if s.ruler_b.is_none() {
+                            s.ruler_b = Some((rx, ry));
+                        } else {
+                            // Start a new measurement from this point.
+                            s.ruler_a = Some((rx, ry));
+                            s.ruler_b = None;
                         }
                     }
                 }
@@ -639,6 +668,16 @@ impl FloorPlanView {
         self.widget.queue_draw();
     }
 
+    pub fn set_show_origin(&self, show: bool) {
+        self.state.borrow_mut().show_origin = show;
+        self.widget.queue_draw();
+    }
+
+    pub fn set_show_scale(&self, show: bool) {
+        self.state.borrow_mut().show_scale = show;
+        self.widget.queue_draw();
+    }
+
     // ── Draw mode ──────────────────────────────────────────────────────────
 
     pub fn set_draw_mode(&self, mode: DrawMode) {
@@ -647,6 +686,9 @@ impl FloorPlanView {
             s.calib_a = None;
             s.calib_b = None;
         }
+        // Ruler points are transient: clear them whenever the mode changes.
+        s.ruler_a = None;
+        s.ruler_b = None;
         s.mode = mode;
     }
 
@@ -993,11 +1035,21 @@ fn draw_all(state: &FloorPlanState, ctx: &Context, w: i32, h: i32) {
         draw_pending_measurement(ctx, map_w, map_h, state);
     }
 
-    // 6. Calibration visualization
-    draw_calibration(ctx, map_w, map_h, state);
+    // 6. Calibration / scale visualization. Shown when enabled, or always
+    //    while in Calibrate mode (so it's visible while editing the scale).
+    if state.show_scale || state.mode == DrawMode::Calibrate {
+        draw_calibration(ctx, map_w, map_h, state);
+    }
 
-    // 6.5 Origin marker
-    draw_origin(ctx, map_w, map_h, state);
+    // 6.5 Origin marker. Shown when enabled, or always while in SetOrigin mode.
+    if state.show_origin || state.mode == DrawMode::SetOrigin {
+        draw_origin(ctx, map_w, map_h, state);
+    }
+
+    // 6.6 Ruler distance measurement (Ruler mode only).
+    if state.mode == DrawMode::Ruler {
+        draw_ruler(ctx, map_w, map_h, state);
+    }
 
     // 7. Hover tooltip
     if state.tooltip_visible {
@@ -1005,6 +1057,7 @@ fn draw_all(state: &FloorPlanState, ctx: &Context, w: i32, h: i32) {
             let text = match state.mode {
                 DrawMode::Measure => Some("Click to take measurement"),
                 DrawMode::SetOrigin => Some("Click to place origin (0, 0)"),
+                DrawMode::Ruler => Some("Click two points to measure distance"),
                 _ => None,
             };
             if let Some(t) = text {
@@ -1347,6 +1400,59 @@ fn draw_origin(ctx: &Context, w: f64, h: f64, state: &FloorPlanState) {
     let _ = ctx.show_text("(0, 0)");
 
     ctx.restore().unwrap();
+}
+
+/// Draw the ruler distance measurement: point A, point B, a dashed line
+/// between them, and a distance label (metres if calibrated, else pixels).
+fn draw_ruler(ctx: &Context, w: f64, h: f64, state: &FloorPlanState) {
+    if let Some((ax, ay)) = state.ruler_a {
+        let px = ax * w;
+        let py = ay * h;
+        ctx.set_source_rgba(1.0, 0.2, 0.2, 0.9);
+        ctx.arc(px, py, 6.0, 0.0, std::f64::consts::TAU);
+        ctx.fill().unwrap();
+        ctx.set_source_rgba(1.0, 1.0, 1.0, 0.8);
+        ctx.set_font_size(11.0);
+        ctx.move_to(px + 8.0, py - 4.0);
+        let _ = ctx.show_text("A");
+    }
+
+    if let Some((bx, by)) = state.ruler_b {
+        let px = bx * w;
+        let py = by * h;
+        ctx.set_source_rgba(0.2, 0.5, 1.0, 0.9);
+        ctx.arc(px, py, 6.0, 0.0, std::f64::consts::TAU);
+        ctx.fill().unwrap();
+        ctx.set_source_rgba(1.0, 1.0, 1.0, 0.8);
+        ctx.set_font_size(11.0);
+        ctx.move_to(px + 8.0, py - 4.0);
+        let _ = ctx.show_text("B");
+    }
+
+    if let (Some((ax, ay)), Some((bx, by))) = (state.ruler_a, state.ruler_b) {
+        ctx.set_source_rgba(1.0, 0.9, 0.0, 0.7);
+        ctx.set_line_width(1.5);
+        ctx.set_dash(&[4.0, 4.0], 0.0);
+        ctx.move_to(ax * w, ay * h);
+        ctx.line_to(bx * w, by * h);
+        let _ = ctx.stroke();
+        ctx.set_dash(&[], 0.0);
+
+        // Distance label: metres if the scale is calibrated, else pixels.
+        let dx = (bx - ax) * w;
+        let dy = (by - ay) * h;
+        let px_dist = (dx * dx + dy * dy).sqrt();
+        let label = match state.scale_px_per_m {
+            Some(scale) => format!("{:.2} m", px_dist / scale),
+            None => format!("{:.0} px (calibrate for metres)", px_dist),
+        };
+        let mx = (ax + bx) / 2.0 * w;
+        let my = (ay + by) / 2.0 * h - 6.0;
+        ctx.set_source_rgba(1.0, 0.9, 0.0, 0.9);
+        ctx.set_font_size(11.0);
+        ctx.move_to(mx, my);
+        let _ = ctx.show_text(&label);
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
