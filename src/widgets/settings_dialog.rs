@@ -9,7 +9,7 @@ const APP_VERSION: &str = env!("APP_VERSION");
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::models::{AppSettings, ThroughputUnit};
+use crate::models::{AppSettings, ColorMetric, ThroughputUnit};
 use crate::persistence::SettingsStore;
 use crate::utils::flatpak::is_flatpak;
 
@@ -159,6 +159,24 @@ impl SettingsDialog {
         unit_switch.set_active(settings.borrow().throughput_unit == ThroughputUnit::MByte);
         display_group.add(&unit_switch);
 
+        // Cell colour metric selector
+        let color_row = ActionRow::new();
+        color_row.set_title("Colour measurements by");
+        color_row.set_subtitle("Signal strength, iperf or Samba throughput");
+
+        let color_model = gtk4::StringList::new(&["Signal strength", "iperf throughput", "Samba throughput"]);
+        let color_values = [ColorMetric::SignalDbm, ColorMetric::IperfMbps, ColorMetric::SmbMbps];
+        let current_color = settings.borrow().color_metric;
+        let color_selected_idx = color_values
+            .iter()
+            .position(|&v| v == current_color)
+            .unwrap_or(0) as u32;
+        let color_drop = gtk4::DropDown::new(Some(color_model), gtk4::Expression::NONE);
+        color_drop.set_selected(color_selected_idx);
+        color_drop.set_valign(gtk4::Align::Center);
+        color_row.add_suffix(&color_drop);
+        display_group.add(&color_row);
+
         page.add(&iperf_group);
         if !is_flatpak() {
             page.add(&smb_group);
@@ -292,6 +310,7 @@ impl SettingsDialog {
                 } else {
                     ThroughputUnit::Mbit
                 };
+                s.color_metric = color_values[color_drop.selected() as usize];
                 let _ = SettingsStore::save(&s);
                 gtk4::glib::Propagation::Proceed
             });

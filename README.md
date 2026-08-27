@@ -1,3 +1,21 @@
+## Fork of danst0/wifichecker
+
+This project is a fork of https://github.com/danst0/wifichecker.
+I implemented a few features and fixed a few bugs so it would be a bit more useful for my particular usecase.
+Here is a summary of the changes made:
+
+- **Project save/load** – multiple floors, per-project drawings, auto-save, and a project menu (Open / Save As).
+- **Fixed a crash** in calibrate mode (`RefCell already borrowed`).
+- **Unified map coordinate space** – fixed origin/grid/cell drift on window resize; the origin now persists across restarts.
+- **Select/Inspect tool** – click a measurement on the map or in the list; two‑way correlation between map, list, and a "Selected Measurement" detail view.
+- **Live Current Signal** – the panel refreshes the active WiFi signal ~every 1.5 s; new measurements are auto‑selected.
+- **In‑flight measurement indicator** – a pulsating box marks the cell being measured, and repeated clicks are ignored while a measurement is running.
+- **Absolute, configurable colour scale** – colour cells by Signal strength, iperf, or Samba throughput (a fixed reference range, so a sample's colour is stable); the legend shows tick marks/labels.
+- **Legend pointer** – a marker on the gradient shows where a selected measurement (or the live current signal, when nothing is selected) lands.
+- **Resizable side panel** – drag the divider between the map and the panel.
+- **Custom select (cursor) tool icon.**
+
+
 <p align="center">
   <img src="data/icons/scalable/apps/io.github.danst0.wifichecker.png" width="128" alt="WiFi Checker icon"/>
 </p>

@@ -111,6 +111,15 @@ fn auto_save(fp: &FloorPlanView, state: &Rc<RefCell<AppState>>) {
     let _ = JsonStore::save(&project, &project_path);
 }
 
+/// Look up a measurement by id in the current floor (used to feed the
+/// legend's selection pointer with the selected sample).
+fn find_measurement(state: &Rc<RefCell<AppState>>, id: &str) -> Option<Measurement> {
+    let s = state.borrow();
+    s.project.floors
+        .get(s.current_floor)
+        .and_then(|f| f.measurements.iter().find(|m| m.id == id).cloned())
+}
+
 /// Load a floor's data (image, canvas, calibration, measurements) into the
 /// floor-plan view, legend bar, and measurement panel.
 fn load_floor_into_view(
@@ -125,6 +134,8 @@ fn load_floor_into_view(
     // Selection is transient; clear it when switching/loading a floor.
     fp.set_selected_measurement(None);
     panel.set_selected_by_id(None);
+    legend.set_selected_measurement(None);
+    fp.set_pending_measurement(None);
     if let Some(ref p) = floor.image_path {
         if p.to_lowercase().ends_with(".pdf") {
             fp.set_pdf(p, floor.pdf_page.unwrap_or(0));
@@ -215,11 +226,37 @@ fn apply_project(
     state.borrow().project.name.clone()
 }
 
+/// Register the custom "normal mouse arrow" symbolic icon used by the
+/// Select tool. The SVG is written to a temp dir that is added to the icon
+/// search path (in the standard icon-theme sub-directories), so the arrow
+/// recolours with the active colour scheme.
+fn register_custom_icons() {
+    const SELECT_ICON_SVG: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><path d="M 3 1.5 L 3 12 L 5.8 9.4 L 7.4 13.4 L 9.2 12.6 L 7.6 8.7 L 11.2 8.7 Z" fill="black"/></svg>"#;
+    let base = std::env::temp_dir().join("wifichecker-icons");
+    // Standard icon-theme sub-directories so GtkIconTheme finds it at any size.
+    let subs = [
+        "scalable/actions",
+        "16x16/actions", "24x24/actions", "32x32/actions",
+        "48x48/actions", "64x64/actions",
+    ];
+    for sub in subs {
+        let d = base.join(sub);
+        if std::fs::create_dir_all(&d).is_err() {
+            continue;
+        }
+        let _ = std::fs::write(d.join("select-cursor-symbolic.svg"), SELECT_ICON_SVG);
+    }
+    if let Some(display) = gtk4::gdk::Display::default() {
+        gtk4::IconTheme::for_display(&display).add_search_path(&base);
+    }
+}
+
 fn build_ui(
     window: &ApplicationWindow,
     state: Rc<RefCell<AppState>>,
     settings: Rc<RefCell<AppSettings>>,
 ) -> ToastOverlay {
+    register_custom_icons();
     let overlay = ToastOverlay::new();
     let main_box = GtkBox::new(Orientation::Vertical, 0);
 
@@ -291,7 +328,7 @@ fn build_ui(
         .group(&mode_measure)
         .build();
     let mode_select = ToggleButton::builder()
-        .icon_name("focus-symbolic")
+        .icon_name("select-cursor-symbolic")
         .tooltip_text("Select mode (click a point to inspect a measurement)")
         .group(&mode_measure)
         .build();
@@ -334,11 +371,11 @@ fn build_ui(
         .tooltip_text("Reset zoom")
         .build();
 
+    draw_bar.append(&mode_select);
     draw_bar.append(&mode_measure);
     draw_bar.append(&mode_draw);
     draw_bar.append(&mode_calib);
     draw_bar.append(&mode_origin);
-    draw_bar.append(&mode_select);
     draw_bar.append(&Separator::new(Orientation::Vertical));
     draw_bar.append(&clear_canvas_btn);
     draw_bar.append(&Separator::new(Orientation::Vertical));
@@ -354,7 +391,7 @@ fn build_ui(
     main_box.append(&draw_bar);
 
     // ── Body ──────────────────────────────────────────────────────────────────
-    let body = GtkBox::new(Orientation::Horizontal, 0);
+    let body = gtk4::Paned::new(Orientation::Horizontal);
     body.set_vexpand(true);
 
     let floor_plan = FloorPlanView::new();
@@ -362,14 +399,15 @@ fn build_ui(
     floor_plan.set_grid_spacing(settings.borrow().grid_spacing_m);
     floor_plan.set_measurement_grid_spacing(settings.borrow().measurement_grid_spacing_m);
     floor_plan.set_snap_to_grid(settings.borrow().snap_to_grid);
+    floor_plan.set_color_metric(settings.borrow().color_metric);
 
     let legend = LegendBar::new();
+    legend.set_color_metric(settings.borrow().color_metric);
     let fp_col = GtkBox::new(Orientation::Vertical, 0);
     fp_col.set_hexpand(true);
     fp_col.set_vexpand(true);
     fp_col.append(&floor_plan.widget);
     fp_col.append(&legend.widget);
-    body.append(&fp_col);
 
     let sidebar = GtkBox::new(Orientation::Vertical, 6);
     sidebar.set_width_request(290);
@@ -377,7 +415,23 @@ fn build_ui(
     let panel = MeasurementPanel::new();
 
     sidebar.append(&panel.widget);
-    body.append(&sidebar);
+
+    body.set_start_child(Some(&fp_col));
+    body.set_end_child(Some(&sidebar));
+    // One-shot: once the paned has a size, give the sidebar its requested width.
+    // The divider is draggable afterwards to resize either side.
+    {
+        let body_init = body.clone();
+        let _ = glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+            let total = body_init.width();
+            if total > 0 {
+                body_init.set_position((total - 290).max(100));
+                glib::ControlFlow::Break
+            } else {
+                glib::ControlFlow::Continue
+            }
+        });
+    }
     main_box.append(&body);
     overlay.set_child(Some(&main_box));
 
@@ -472,8 +526,18 @@ fn build_ui(
         let overlay_ref = overlay.clone();
         let settings = settings.clone();
         let legend = legend.clone();
+        // Guards against starting a new measurement while one is in flight.
+        let measuring: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
 
         floor_plan.set_on_measure_click(move |rx, ry| {
+            // Block new measurements while one is in progress.
+            if *measuring.borrow() {
+                overlay_ref.add_toast(Toast::new("Measurement in progress — please wait"));
+                return;
+            }
+            *measuring.borrow_mut() = true;
+            fp.set_pending_measurement(Some((rx, ry)));
+
             let (iperf_enabled, iperf_server, iperf_port, iperf_dur, iperf_streams,
                  smb_enabled, smb_server, smb_share, smb_user, smb_pass,
                  unit) = {
@@ -530,12 +594,20 @@ fn build_ui(
             let panel3 = panel.clone();
             let overlay2 = overlay_ref.clone();
             let legend2 = legend.clone();
+            let measuring2 = measuring.clone();
 
             glib::spawn_future_local(async move {
-                let Ok(result) = recv.recv().await else { return; };
+                let Ok(result) = recv.recv().await else {
+                    *measuring2.borrow_mut() = false;
+                    fp2.set_pending_measurement(None);
+                    panel3.set_measuring(false, "");
+                    return;
+                };
                 panel3.set_measuring(false, "");
 
                 let Some(info) = result.wifi else {
+                    *measuring2.borrow_mut() = false;
+                    fp2.set_pending_measurement(None);
                     overlay2.add_toast(Toast::new("No active WiFi connection"));
                     // Still surface speed-test errors even without WiFi
                     if let Some(ref e) = result.iperf_error {
@@ -572,6 +644,8 @@ fn build_ui(
                         let measurements = floor.measurements.clone();
                         (measurements.clone(), measurements)
                     } else {
+                        *measuring2.borrow_mut() = false;
+                        fp2.set_pending_measurement(None);
                         return;
                     }
                 };
@@ -585,10 +659,14 @@ fn build_ui(
                     info.signal_dbm, info.frequency_mhz, info.channel,
                     result.iperf_mbps, result.smb_mbps, unit,
                 );
+                legend2.set_current_signal(Some(info.signal_dbm as f64));
                 // Show the just-recorded sample in Selected Measurement + highlight it.
                 fp2.set_selected_measurement(Some(new_id.clone()));
+                legend2.set_selected_measurement(measurements.iter().find(|m| m.id == new_id).cloned());
                 panel3.set_selected_by_id(Some(new_id));
                 auto_save(&fp2, &state2);
+                *measuring2.borrow_mut() = false;
+                fp2.set_pending_measurement(None);
                 let mut toast_msg = format!("{} dBm | {}", info.signal_dbm, info.ssid);
                 if let Some(mbps) = result.iperf_mbps {
                     toast_msg.push_str(&format!(" | ⚡{}", unit.format_short(mbps)));
@@ -670,7 +748,11 @@ fn build_ui(
     // Measurement selection: two-way correlation between map and list
     {
         let panel = panel.clone();
+        let legend = legend.clone();
+        let state = state.clone();
         floor_plan.set_on_select_measurement(move |id| {
+            let sel = id.as_ref().and_then(|id| find_measurement(&state, id));
+            legend.set_selected_measurement(sel);
             panel.set_selected_by_id(id);
         });
     }
@@ -678,8 +760,11 @@ fn build_ui(
         let fp = floor_plan.clone();
         let panel = panel.clone();
         let panel_cb = panel.clone();
+        let legend = legend.clone();
+        let state = state.clone();
         panel.set_on_row_clicked(move |id| {
             fp.set_selected_measurement(Some(id.clone()));
+            legend.set_selected_measurement(find_measurement(&state, &id));
             panel_cb.set_selected_by_id(Some(id));
         });
     }
@@ -687,8 +772,10 @@ fn build_ui(
     // Live Current Signal: periodically refresh with the active WiFi AP.
     {
         let panel = panel.clone();
+        let legend = legend.clone();
         let _ = glib::timeout_add_local(std::time::Duration::from_millis(1500), move || {
             let p = panel.clone();
+            let lg = legend.clone();
             let (tx, rx) = async_channel::bounded(1);
             std::thread::spawn(move || {
                 let info = WifiScanner::scan().ok().flatten();
@@ -697,8 +784,14 @@ fn build_ui(
             glib::spawn_future_local(async move {
                 let Ok(info) = rx.recv().await else { return };
                 match info {
-                    Some(w) => p.refresh_live_signal(&w.ssid, &w.bssid, w.signal_dbm, w.frequency_mhz, w.channel),
-                    None => p.set_no_wifi(),
+                    Some(w) => {
+                        p.refresh_live_signal(&w.ssid, &w.bssid, w.signal_dbm, w.frequency_mhz, w.channel);
+                        lg.set_current_signal(Some(w.signal_dbm as f64));
+                    }
+                    None => {
+                        p.set_no_wifi();
+                        lg.set_current_signal(None);
+                    }
                 }
             });
             glib::ControlFlow::Continue
@@ -788,6 +881,7 @@ fn build_ui(
                         panel2.set_measurements(vec![]);
                         fp2.set_selected_measurement(None);
                         panel2.set_selected_by_id(None);
+                        legend2.set_selected_measurement(None);
                         auto_save(&fp2, &state2);
                         overlay2.add_toast(Toast::new("Measurements deleted"));
                     }
@@ -803,6 +897,7 @@ fn build_ui(
                         panel2.set_measurements(vec![]);
                         fp2.set_selected_measurement(None);
                         panel2.set_selected_by_id(None);
+                        legend2.set_selected_measurement(None);
                         auto_save(&fp2, &state2);
                         overlay2.add_toast(Toast::new("All measurements deleted"));
                     }
@@ -1053,20 +1148,24 @@ fn build_ui(
         let fp = floor_plan.clone();
         let grid_toggle = grid_toggle.clone();
         let panel_ref = panel.clone();
+        let legend_ref = legend.clone();
         settings_btn.connect_clicked(move |_| {
             let dlg = SettingsDialog::new(&window_ref, settings.clone());
             let fp2 = fp.clone();
             let grid_toggle2 = grid_toggle.clone();
             let settings2 = settings.clone();
             let panel2 = panel_ref.clone();
+            let legend2 = legend_ref.clone();
             dlg.window.connect_close_request(move |_| {
                 let s = settings2.borrow();
                 fp2.set_show_grid(s.show_grid);
                 fp2.set_grid_spacing(s.grid_spacing_m);
                 fp2.set_measurement_grid_spacing(s.measurement_grid_spacing_m);
                 fp2.set_snap_to_grid(s.snap_to_grid);
+                fp2.set_color_metric(s.color_metric);
                 grid_toggle2.set_active(s.show_grid);
                 panel2.set_throughput_unit(s.throughput_unit);
+                legend2.set_color_metric(s.color_metric);
                 gtk4::glib::Propagation::Proceed
             });
             dlg.window.present();

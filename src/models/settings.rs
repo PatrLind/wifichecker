@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use super::ColorMetric;
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum ThroughputUnit {
     Mbit,
@@ -52,6 +54,8 @@ pub struct AppSettings {
 
     // Display
     pub throughput_unit: ThroughputUnit,
+    /// Which measurement value the floor-plan cell colours are based on.
+    pub color_metric: ColorMetric,
 
     // UI state
     pub last_floor_index: usize,
@@ -78,6 +82,7 @@ impl Default for AppSettings {
             snap_to_grid: false,
 
             throughput_unit: ThroughputUnit::Mbit,
+            color_metric: ColorMetric::default(),
 
             last_floor_index: 0,
         }
@@ -138,6 +143,7 @@ mod tests {
         assert_eq!(s.measurement_grid_spacing_m, 1.0);
         assert!(!s.snap_to_grid);
         assert_eq!(s.throughput_unit, ThroughputUnit::Mbit);
+        assert_eq!(s.color_metric, ColorMetric::SignalDbm);
     }
 
     #[test]

@@ -1,0 +1,113 @@
+use serde::{Deserialize, Serialize};
+
+use super::Measurement;
+
+/// Which measurement value the floor-plan cell colours are based on.
+///
+/// This is a user setting (see `AppSettings::color_metric`); the colour scale
+/// itself is absolute (fixed reference range), so a sample's colour is stable
+/// regardless of what other samples exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ColorMetric {
+    SignalDbm,
+    IperfMbps,
+    SmbMbps,
+}
+
+impl Default for ColorMetric {
+    fn default() -> Self { ColorMetric::SignalDbm }
+}
+
+impl ColorMetric {
+    /// Fixed (absolute) reference range for the colour scale: red at `min`,
+    /// green at `max`. Values outside the range are clamped.
+    ///
+    /// - Signal: −90 dBm (very poor/red) … −50 dBm (excellent/green).
+    ///   This follows the common WiFi signal rating, so −70 dBm ("Fair")
+    ///   lands at the midpoint (yellow):
+    ///     −30…−50 excellent (green) · −51…−67 very good/good (green‑yellow)
+    ///     −68…−70 fair (yellow) · −71…−80 poor (orange) · −81…−90 very poor
+    ///     (red) · < −90 unusable (red).
+    /// - Bandwidth: 0 … 1 Gbit/s (1000 Mbit/s)
+    pub fn reference_range(self) -> (f64, f64) {
+        match self {
+            ColorMetric::SignalDbm => (-90.0, -50.0),
+            ColorMetric::IperfMbps | ColorMetric::SmbMbps => (0.0, 1000.0),
+        }
+    }
+
+    /// Short display name (used in the legend).
+    pub fn label(self) -> &'static str {
+        match self {
+            ColorMetric::SignalDbm => "Signal",
+            ColorMetric::IperfMbps => "iperf",
+            ColorMetric::SmbMbps   => "Samba",
+        }
+    }
+
+    /// Unit label for the scale endpoints (used in the legend).
+    pub fn unit(self) -> &'static str {
+        match self {
+            ColorMetric::SignalDbm => "dBm",
+            _ => "Mbit/s",
+        }
+    }
+}
+
+/// The value of a measurement for a given metric, if that metric is present.
+pub fn metric_value(m: &Measurement, metric: ColorMetric) -> Option<f64> {
+    match metric {
+        ColorMetric::SmbMbps   => m.smb_mbps,
+        ColorMetric::IperfMbps => m.iperf_mbps,
+        ColorMetric::SignalDbm => Some(m.signal_dbm as f64),
+    }
+}
+
+/// Map a value to a (r, g, b) colour on the red → yellow → green scale.
+pub fn value_color(val: f64, min: f64, max: f64) -> (f64, f64, f64) {
+    let t = if max > min { ((val - min) / (max - min)).clamp(0.0, 1.0) } else { 0.5 };
+    if t >= 0.5 { (1.0 - (t - 0.5) * 2.0, 1.0, 0.0) } else { (1.0, t * 2.0, 0.0) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_metric_is_signal() {
+        assert_eq!(ColorMetric::default(), ColorMetric::SignalDbm);
+    }
+
+    #[test]
+    fn reference_range_signal() {
+        assert_eq!(ColorMetric::SignalDbm.reference_range(), (-90.0, -50.0));
+    }
+
+    #[test]
+    fn reference_range_bandwidth_is_1_gbit() {
+        assert_eq!(ColorMetric::IperfMbps.reference_range(), (0.0, 1000.0));
+        assert_eq!(ColorMetric::SmbMbps.reference_range(), (0.0, 1000.0));
+    }
+
+    #[test]
+    fn value_color_endpoints() {
+        // red at min, green at max, yellow at mid (using the signal range)
+        let (min, max) = (-90.0, -50.0);
+        let (r, g, b) = value_color(-90.0, min, max);
+        assert!((r - 1.0).abs() < 1e-6 && g < 1e-6 && b < 1e-6); // red
+        let (r, g, b) = value_color(-50.0, min, max);
+        assert!(r < 1e-6 && (g - 1.0).abs() < 1e-6 && b < 1e-6); // green
+        let (r, g, b) = value_color(-70.0, min, max);
+        assert!((r - 1.0).abs() < 1e-6 && (g - 1.0).abs() < 1e-6 && b < 1e-6); // yellow
+    }
+
+    #[test]
+    fn value_color_clamps_out_of_range() {
+        let (min, max) = (0.0, 1000.0);
+        // Above max → green, below min → red
+        let (r, g, _b) = value_color(5000.0, min, max);
+        assert!(r < 1e-6 && (g - 1.0).abs() < 1e-6);
+        let (r, g, _b) = value_color(-50.0, min, max);
+        assert!((r - 1.0).abs() < 1e-6 && g < 1e-6);
+    }
+}

@@ -1,4 +1,5 @@
 use gtk4::prelude::*;
+use gtk4::glib;
 use gtk4::{DrawingArea, EventControllerKey, EventControllerMotion, EventControllerScroll, GestureDrag};
 use gdk_pixbuf::Pixbuf;
 use cairo::{Context, ImageSurface, Format};
@@ -7,28 +8,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 use crate::models::Measurement;
-
-#[derive(Clone, Copy)]
-pub enum ColorMetric { SmbMbps, IperfMbps, SignalDbm }
-
-fn value_color(val: f64, min: f64, max: f64) -> (f64, f64, f64) {
-    let t = if max > min { ((val - min) / (max - min)).clamp(0.0, 1.0) } else { 0.5 };
-    if t >= 0.5 { (1.0 - (t - 0.5) * 2.0, 1.0, 0.0) } else { (1.0, t * 2.0, 0.0) }
-}
-
-fn active_metric(measurements: &[Measurement]) -> ColorMetric {
-    if measurements.iter().any(|m| m.smb_mbps.is_some())   { return ColorMetric::SmbMbps; }
-    if measurements.iter().any(|m| m.iperf_mbps.is_some()) { return ColorMetric::IperfMbps; }
-    ColorMetric::SignalDbm
-}
-
-fn metric_value(m: &Measurement, metric: ColorMetric) -> Option<f64> {
-    match metric {
-        ColorMetric::SmbMbps   => m.smb_mbps,
-        ColorMetric::IperfMbps => m.iperf_mbps,
-        ColorMetric::SignalDbm => Some(m.signal_dbm as f64),
-    }
-}
+use crate::models::color_metric::{ColorMetric, metric_value, value_color};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DrawMode {
@@ -82,6 +62,12 @@ struct FloorPlanState {
     // not persisted.
     selected_measurement_id: Option<String>,
 
+    // Position of an in-flight measurement (map-relative). While set, a
+    // pulsating box is drawn there to show a measurement is in progress.
+    pending_measurement: Option<(f64, f64)>,
+    /// Phase of the pending-measurement pulse animation (radians).
+    pending_pulse_phase: f64,
+
     // Grid
     show_grid: bool,
     grid_spacing_m: f64,             // visual grid line spacing
@@ -109,7 +95,7 @@ struct FloorPlanState {
     hover_generation: u32,
 
     // Callbacks
-    on_measure_click: Option<Box<dyn Fn(f64, f64)>>,
+    on_measure_click: Option<Rc<dyn Fn(f64, f64)>>,
     on_calibration_complete: Option<Rc<dyn Fn(f64, f64, f64, f64)>>,
     on_draw_complete: Option<Box<dyn Fn()>>,
     on_origin_set: Option<Rc<dyn Fn()>>,
@@ -132,8 +118,8 @@ impl FloorPlanView {
             show_heatmap: true,
             heatmap_alpha: 0.55,
             color_metric: ColorMetric::SignalDbm,
-            color_min: -90.0,
-            color_max: -30.0,
+            color_min: ColorMetric::SignalDbm.reference_range().0,
+            color_max: ColorMetric::SignalDbm.reference_range().1,
             mode: DrawMode::Measure,
             canvas: None,
             last_draw_pos: None,
@@ -153,6 +139,8 @@ impl FloorPlanView {
             scale_px_per_m: None,
             origin: None,
             selected_measurement_id: None,
+            pending_measurement: None,
+            pending_pulse_phase: 0.0,
             show_grid: true,
             grid_spacing_m: 1.0,
             measurement_grid_spacing_m: 1.0,
@@ -177,6 +165,22 @@ impl FloorPlanView {
                     apply_pending_fit(&mut s, w as f64, h as f64);
                 }
                 draw_all(&state.borrow(), ctx, w, h);
+            });
+        }
+
+        // Animation timer: advance the pending-measurement pulse and redraw
+        // (only does work while a measurement is in flight).
+        {
+            let state = state.clone();
+            let area_weak = area.downgrade();
+            let _ = glib::timeout_add_local(std::time::Duration::from_millis(33), move || {
+                let Some(area) = area_weak.upgrade() else { return glib::ControlFlow::Break };
+                let mut s = state.borrow_mut();
+                if s.pending_measurement.is_some() {
+                    s.pending_pulse_phase += 0.15;
+                    area.queue_draw();
+                }
+                glib::ControlFlow::Continue
             });
         }
 
@@ -223,7 +227,12 @@ impl FloorPlanView {
                             rx = (scx + px_step / 2.0) / mw;
                             ry = (scy + px_step / 2.0) / mh;
                         }
-                        if let Some(ref cb) = s.on_measure_click {
+                        // Drop the mutable borrow before invoking the callback:
+                        // it re-enters FloorPlanState (set_pending_measurement),
+                        // so we must not hold `s` while it runs.
+                        let cb = s.on_measure_click.clone();
+                        drop(s);
+                        if let Some(cb) = cb {
                             cb(rx, ry);
                         }
                     }
@@ -606,23 +615,22 @@ impl FloorPlanView {
     }
 
     pub fn set_measurements(&self, measurements: Vec<Measurement>) {
-        let metric = active_metric(&measurements);
-        let values: Vec<f64> = measurements.iter()
-            .filter_map(|m| metric_value(m, metric))
-            .collect();
-        let (min, max) = if values.is_empty() {
-            (-90.0, -30.0)
-        } else {
-            let lo = values.iter().cloned().fold(f64::MAX, f64::min);
-            let hi = values.iter().cloned().fold(f64::MIN, f64::max);
-            if (hi - lo).abs() < 1.0 { (lo - 5.0, hi + 5.0) } else { (lo, hi) }
-        };
         let mut state = self.state.borrow_mut();
         state.measurements = measurements;
-        state.color_metric = metric;
-        state.color_min = min;
-        state.color_max = max;
         drop(state);
+        self.widget.queue_draw();
+    }
+
+    /// Set which metric the cell colours are based on, applying its fixed
+    /// (absolute) reference range. A sample's colour is independent of the
+    /// other samples, so it stays stable as samples are added/removed.
+    pub fn set_color_metric(&self, metric: ColorMetric) {
+        let (min, max) = metric.reference_range();
+        let mut s = self.state.borrow_mut();
+        s.color_metric = metric;
+        s.color_min = min;
+        s.color_max = max;
+        drop(s);
         self.widget.queue_draw();
     }
 
@@ -770,7 +778,7 @@ impl FloorPlanView {
     // ── Callbacks ──────────────────────────────────────────────────────────
 
     pub fn set_on_measure_click<F: Fn(f64, f64) + 'static>(&self, cb: F) {
-        self.state.borrow_mut().on_measure_click = Some(Box::new(cb));
+        self.state.borrow_mut().on_measure_click = Some(Rc::new(cb));
     }
 
     pub fn set_on_calibration_complete<F: Fn(f64, f64, f64, f64) + 'static>(&self, cb: F) {
@@ -799,6 +807,18 @@ impl FloorPlanView {
 
     pub fn get_selected_measurement(&self) -> Option<String> {
         self.state.borrow().selected_measurement_id.clone()
+    }
+
+    /// Set (or clear, with `None`) the in-flight measurement position so a
+    /// pulsating box is drawn there while a measurement is running.
+    pub fn set_pending_measurement(&self, pos: Option<(f64, f64)>) {
+        let mut s = self.state.borrow_mut();
+        s.pending_measurement = pos;
+        if pos.is_none() {
+            s.pending_pulse_phase = 0.0;
+        }
+        drop(s);
+        self.widget.queue_draw();
     }
 
     // ── Zoom ───────────────────────────────────────────────────────────────
@@ -968,6 +988,11 @@ fn draw_all(state: &FloorPlanState, ctx: &Context, w: i32, h: i32) {
         draw_selection(ctx, map_w, map_h, state);
     }
 
+    // 5.6 In-flight measurement indicator (pulsating box at the clicked cell)
+    if state.pending_measurement.is_some() {
+        draw_pending_measurement(ctx, map_w, map_h, state);
+    }
+
     // 6. Calibration visualization
     draw_calibration(ctx, map_w, map_h, state);
 
@@ -1115,17 +1140,52 @@ fn draw_selection(ctx: &Context, map_w: f64, map_h: f64, state: &FloorPlanState)
     ctx.save().unwrap();
     // Cell outline
     ctx.set_source_rgba(0.25, 0.65, 1.0, 0.95);
-    ctx.set_line_width(2.5);
+    ctx.set_line_width(2.0);
+    let inset = (px_step - 3.0).max(1.0);
+    ctx.rectangle(cell_x + 1.5, cell_y + 1.5, inset, inset);
+    ctx.stroke().unwrap();
+
+    // Prominent "target" marker at the exact point: dark halo for contrast,
+    // white disc, blue ring, blue centre dot. Visible on any cell colour.
+    ctx.set_source_rgba(0.0, 0.0, 0.0, 0.45);
+    ctx.arc(px, py, 10.0, 0.0, std::f64::consts::TAU);
+    ctx.fill().unwrap();
+    ctx.set_source_rgba(1.0, 1.0, 1.0, 0.98);
+    ctx.arc(px, py, 7.5, 0.0, std::f64::consts::TAU);
+    ctx.fill().unwrap();
+    ctx.set_source_rgba(0.20, 0.55, 1.0, 1.0);
+    ctx.set_line_width(2.0);
+    ctx.arc(px, py, 7.5, 0.0, std::f64::consts::TAU);
+    ctx.stroke().unwrap();
+    ctx.arc(px, py, 3.0, 0.0, std::f64::consts::TAU);
+    ctx.fill().unwrap();
+    ctx.restore().unwrap();
+}
+
+/// Draw a pulsating gray box at the cell of an in-flight measurement, showing
+/// that a scan / speed test is running there.
+fn draw_pending_measurement(ctx: &Context, map_w: f64, map_h: f64, state: &FloorPlanState) {
+    let Some((prx, pry)) = state.pending_measurement else { return };
+    let px = prx * map_w;
+    let py = pry * map_h;
+    let origin = state.origin.map(|(rx, ry)| (rx * map_w, ry * map_h)).unwrap_or((0.0, 0.0));
+    let px_step = grid_px_step(state.scale_px_per_m, state.measurement_grid_spacing_m);
+    let (cell_x, cell_y) = cell_anchor(px, py, px_step, origin);
+
+    // Pulse: oscillate the fill alpha over time.
+    let pulse = 0.5 + 0.5 * state.pending_pulse_phase.sin();
+    let alpha = 0.30 + 0.30 * pulse;
+
+    ctx.save().unwrap();
+    // Grayed-out cell
+    ctx.set_source_rgba(0.85, 0.85, 0.85, alpha);
+    ctx.rectangle(cell_x, cell_y, px_step, px_step);
+    ctx.fill().unwrap();
+    // Bright border
+    ctx.set_source_rgba(1.0, 1.0, 1.0, 0.85);
+    ctx.set_line_width(2.0);
     let inset = (px_step - 2.0).max(1.0);
     ctx.rectangle(cell_x + 1.0, cell_y + 1.0, inset, inset);
-    ctx.stroke().unwrap();
-    // Point marker
-    ctx.set_source_rgba(1.0, 1.0, 1.0, 0.95);
-    ctx.arc(px, py, 5.0, 0.0, std::f64::consts::TAU);
-    ctx.fill().unwrap();
-    ctx.set_source_rgba(0.25, 0.65, 1.0, 0.95);
-    ctx.set_line_width(1.5);
-    ctx.arc(px, py, 5.0, 0.0, std::f64::consts::TAU);
     ctx.stroke().unwrap();
     ctx.restore().unwrap();
 }
