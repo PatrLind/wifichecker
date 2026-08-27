@@ -9,6 +9,7 @@ use crate::models::{Measurement, ThroughputUnit};
 pub struct MeasurementPanel {
     pub widget: GtkBox,
     current_label: Label,
+    network_warn: Label,
     selected_label: Label,
     status_box: GtkBox,
     spinner: Spinner,
@@ -39,9 +40,18 @@ impl MeasurementPanel {
         current_label.set_wrap(true);
         current_label.add_css_class("caption");
 
+        // Shown when the current SSID differs from the survey network (the
+        // network of the most recent sample).
+        let network_warn = Label::new(None);
+        network_warn.set_xalign(0.0);
+        network_warn.set_wrap(true);
+        network_warn.add_css_class("warning");
+        network_warn.set_visible(false);
+
         let current_group = libadwaita::PreferencesGroup::new();
         current_group.set_title("Current Signal");
         current_group.add(&current_label);
+        current_group.add(&network_warn);
         vbox.append(&current_group);
 
         // Selected measurement details (inspect mode)
@@ -125,6 +135,7 @@ impl MeasurementPanel {
         Self {
             widget: vbox,
             current_label,
+            network_warn,
             selected_label,
             status_box,
             spinner,
@@ -181,6 +192,18 @@ impl MeasurementPanel {
 
     pub fn set_no_wifi(&self) {
         self.current_label.set_label("No WiFi connection detected");
+    }
+
+    /// Show/hide a warning that the current SSID is not one of this floor's
+    /// measured networks. Pass a pre-formatted message to show, `None` to hide.
+    pub fn set_network_warning(&self, msg: Option<String>) {
+        match msg {
+            Some(text) => {
+                self.network_warn.set_label(&text);
+                self.network_warn.set_visible(true);
+            }
+            None => self.network_warn.set_visible(false),
+        }
     }
 
     /// Refresh the live Current Signal with the active AP. No throughput is

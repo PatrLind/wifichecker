@@ -1,7 +1,7 @@
 ## Fork of danst0/wifichecker
 
 This project is a fork of https://github.com/danst0/wifichecker.
-I implemented a few features and fixed a few bugs so it would be a bit more useful for my particular usecase.
+I used Qwen 3.8 27B to implement a few new features and fixed a few bugs so it would be a bit more useful for my particular usecase.
 Here is a summary of the changes made:
 
 - **Project save/load** – multiple floors, per-project drawings, auto-save, and a project menu (Open / Save As).
@@ -13,6 +13,7 @@ Here is a summary of the changes made:
 - **Absolute, configurable colour scale** – colour cells by Signal strength, iperf, or Samba throughput (a fixed reference range, so a sample's colour is stable); the legend shows tick marks/labels.
 - **Legend pointer** – a marker on the gradient shows where a selected measurement (or the live current signal, when nothing is selected) lands.
 - **Resizable side panel** – drag the divider between the map and the panel.
+- **Network consistency** – a floor tracks the set of SSIDs it has measured; when you're connected to a new SSID you get a warning, and measuring on it asks for confirmation (so a 2 GHz + 5 GHz SSID can be mapped together, while an unrelated network still triggers a warning).
 - **Custom select (cursor) tool icon.**
 
 

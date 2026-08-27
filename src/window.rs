@@ -120,6 +120,68 @@ fn find_measurement(state: &Rc<RefCell<AppState>>, id: &str) -> Option<Measureme
         .and_then(|f| f.measurements.iter().find(|m| m.id == id).cloned())
 }
 
+/// The distinct SSIDs already measured on the current floor, in first-seen
+/// order. This is the set of "known" networks for this floor; a sample is
+/// only flagged when its SSID is not in this set (so multiple networks, e.g.
+/// a 2 GHz and a 5 GHz SSID, can be mapped together without warnings).
+fn known_ssids(state: &Rc<RefCell<AppState>>) -> Vec<String> {
+    let s = state.borrow();
+    let mut v: Vec<String> = Vec::new();
+    if let Some(floor) = s.project.floors.get(s.current_floor) {
+        for m in &floor.measurements {
+            if !v.contains(&m.ssid) {
+                v.push(m.ssid.clone());
+            }
+        }
+    }
+    v
+}
+
+/// Format the "new network" warning message for the current SSID, listing the
+/// known networks on this floor (capped so it stays readable).
+fn format_new_network_warning(ssid: &str, known: &[String]) -> String {
+    let known_str = if known.len() <= 3 {
+        known.join(", ")
+    } else {
+        format!("{} networks", known.len())
+    };
+    format!("⚠ New network: \"{ssid}\" (this floor has: {known_str})")
+}
+
+/// Show a confirm dialog when the user tries to measure on a network that
+/// isn't one of this floor's measured networks. `on_response` is invoked with
+/// true to proceed (record the sample) or false to cancel. The continuation
+/// runs inside the dialog's choose callback — the robust pattern here, since
+/// it works whether or not `choose` blocks the main loop.
+fn show_new_network_confirm(
+    window: &libadwaita::ApplicationWindow,
+    current: &str,
+    known: &[String],
+    on_response: impl FnOnce(bool) + 'static,
+) {
+    let known_str = if known.len() <= 3 {
+        known.join(", ")
+    } else {
+        format!("{} networks", known.len())
+    };
+    let dialog = libadwaita::MessageDialog::builder()
+        .heading("New network")
+        .body(&format!(
+            "You're connected to \"{current}\", which isn't one of this floor's measured networks ({known_str}).\n\nRecord a sample on \"{current}\"?",
+        ))
+        .default_response("cancel")
+        .close_response("cancel")
+        .transient_for(window)
+        .modal(true)
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("ok", "Measure anyway");
+    dialog.set_response_appearance("ok", libadwaita::ResponseAppearance::Suggested);
+    dialog.choose(gtk4::gio::Cancellable::NONE, move |resp| {
+        on_response(resp.as_str() == "ok");
+    });
+}
+
 /// Load a floor's data (image, canvas, calibration, measurements) into the
 /// floor-plan view, legend bar, and measurement panel.
 fn load_floor_into_view(
@@ -135,6 +197,7 @@ fn load_floor_into_view(
     fp.set_selected_measurement(None);
     panel.set_selected_by_id(None);
     legend.set_selected_measurement(None);
+    panel.set_network_warning(None);
     fp.set_pending_measurement(None);
     if let Some(ref p) = floor.image_path {
         if p.to_lowercase().ends_with(".pdf") {
@@ -526,10 +589,22 @@ fn build_ui(
         let overlay_ref = overlay.clone();
         let settings = settings.clone();
         let legend = legend.clone();
+        let window = window.clone();
         // Guards against starting a new measurement while one is in flight.
         let measuring: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
 
-        floor_plan.set_on_measure_click(move |rx, ry| {
+        // Start the actual measurement: guard, pending box, background scan +
+        // speed tests, and recording. Called directly, or after a new-network
+        // confirm.
+        let start_measurement: Rc<dyn Fn(f64, f64)> = Rc::new({
+            let fp = fp.clone();
+            let panel = panel.clone();
+            let state = state.clone();
+            let overlay_ref = overlay_ref.clone();
+            let settings = settings.clone();
+            let legend = legend.clone();
+            let measuring = measuring.clone();
+            move |rx: f64, ry: f64| {
             // Block new measurements while one is in progress.
             if *measuring.borrow() {
                 overlay_ref.add_toast(Toast::new("Measurement in progress — please wait"));
@@ -671,7 +746,53 @@ fn build_ui(
                 if let Some(mbps) = result.iperf_mbps {
                     toast_msg.push_str(&format!(" | ⚡{}", unit.format_short(mbps)));
                 }
+                panel3.set_network_warning(None);
                 overlay2.add_toast(Toast::new(&toast_msg));
+            });
+            }
+        });
+
+        floor_plan.set_on_measure_click(move |rx, ry| {
+            // Block new measurements while one is in progress.
+            if *measuring.borrow() {
+                overlay_ref.add_toast(Toast::new("Measurement in progress — please wait"));
+                return;
+            }
+            let known = known_ssids(&state);
+            if known.is_empty() {
+                // First sample on this floor: no measured networks to be
+                // consistent with yet.
+                start_measurement(rx, ry);
+                return;
+            }
+            // There are known networks. Do a quick background scan for the
+            // current SSID, then (on the main thread, deferred out of the
+            // drag/pointer-grab context) confirm if it is a new network.
+            let (tx, rchan) = async_channel::bounded(1);
+            std::thread::spawn(move || {
+                let cur = WifiScanner::scan().ok().flatten().map(|w| w.ssid);
+                let _ = tx.send_blocking((cur, known));
+            });
+            let start = start_measurement.clone();
+            let window = window.clone();
+            let overlay = overlay_ref.clone();
+            glib::spawn_future_local(async move {
+                let (cur, known) = rchan.recv().await.unwrap_or((None, Vec::new()));
+                match cur {
+                    Some(c) if !known.contains(&c) => {
+                        // Confirm; the continuation runs in the dialog callback
+                        // (robust whether or not `choose` blocks the main loop).
+                        let start2 = start.clone();
+                        show_new_network_confirm(&window, &c, &known, move |ok| {
+                            if ok {
+                                start2(rx, ry);
+                            } else {
+                                overlay.add_toast(Toast::new("Measurement cancelled"));
+                            }
+                        });
+                    }
+                    _ => start(rx, ry),
+                }
             });
         });
     }
@@ -773,9 +894,17 @@ fn build_ui(
     {
         let panel = panel.clone();
         let legend = legend.clone();
+        let state = state.clone();
+        let overlay = overlay.clone();
+        // Tracks whether the "new network" warning is currently shown, so the
+        // toast only fires on the transition into a mismatch (not every tick).
+        let off_flag: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
         let _ = glib::timeout_add_local(std::time::Duration::from_millis(1500), move || {
             let p = panel.clone();
             let lg = legend.clone();
+            let st = state.clone();
+            let ov = overlay.clone();
+            let off = off_flag.clone();
             let (tx, rx) = async_channel::bounded(1);
             std::thread::spawn(move || {
                 let info = WifiScanner::scan().ok().flatten();
@@ -787,10 +916,28 @@ fn build_ui(
                     Some(w) => {
                         p.refresh_live_signal(&w.ssid, &w.bssid, w.signal_dbm, w.frequency_mhz, w.channel);
                         lg.set_current_signal(Some(w.signal_dbm as f64));
+                        // Warn if we're on a network not yet measured on this floor.
+                        let known = known_ssids(&st);
+                        let msg = if !known.is_empty() && !known.contains(&w.ssid) {
+                            Some(format_new_network_warning(&w.ssid, &known))
+                        } else {
+                            None
+                        };
+                        p.set_network_warning(msg.clone());
+                        match msg {
+                            Some(ref m) if !*off.borrow() => {
+                                *off.borrow_mut() = true;
+                                ov.add_toast(Toast::new(m));
+                            }
+                            None => *off.borrow_mut() = false,
+                            _ => {}
+                        }
                     }
                     None => {
                         p.set_no_wifi();
                         lg.set_current_signal(None);
+                        p.set_network_warning(None);
+                        *off.borrow_mut() = false;
                     }
                 }
             });
@@ -882,6 +1029,7 @@ fn build_ui(
                         fp2.set_selected_measurement(None);
                         panel2.set_selected_by_id(None);
                         legend2.set_selected_measurement(None);
+                        panel2.set_network_warning(None);
                         auto_save(&fp2, &state2);
                         overlay2.add_toast(Toast::new("Measurements deleted"));
                     }
@@ -898,6 +1046,7 @@ fn build_ui(
                         fp2.set_selected_measurement(None);
                         panel2.set_selected_by_id(None);
                         legend2.set_selected_measurement(None);
+                        panel2.set_network_warning(None);
                         auto_save(&fp2, &state2);
                         overlay2.add_toast(Toast::new("All measurements deleted"));
                     }
