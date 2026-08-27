@@ -40,6 +40,8 @@ pub enum DrawMode {
     Calibrate,
     /// Click to set the coordinate origin (0, 0)
     SetOrigin,
+    /// Click to inspect/select an existing measurement
+    Select,
 }
 
 #[derive(Clone)]
@@ -76,6 +78,10 @@ struct FloorPlanState {
     // Origin (0,0) marker
     origin: Option<(f64, f64)>,  // relative coords
 
+    // Currently selected measurement (for inspect/correlation); transient,
+    // not persisted.
+    selected_measurement_id: Option<String>,
+
     // Grid
     show_grid: bool,
     grid_spacing_m: f64,             // visual grid line spacing
@@ -107,6 +113,7 @@ struct FloorPlanState {
     on_calibration_complete: Option<Rc<dyn Fn(f64, f64, f64, f64)>>,
     on_draw_complete: Option<Box<dyn Fn()>>,
     on_origin_set: Option<Rc<dyn Fn()>>,
+    on_select_measurement: Option<Rc<dyn Fn(Option<String>)>>,
 }
 
 impl FloorPlanView {
@@ -145,6 +152,7 @@ impl FloorPlanView {
             calib_b: None,
             scale_px_per_m: None,
             origin: None,
+            selected_measurement_id: None,
             show_grid: true,
             grid_spacing_m: 1.0,
             measurement_grid_spacing_m: 1.0,
@@ -157,6 +165,7 @@ impl FloorPlanView {
             on_calibration_complete: None,
             on_draw_complete: None,
             on_origin_set: None,
+            on_select_measurement: None,
         }));
 
         // Draw function
@@ -245,6 +254,31 @@ impl FloorPlanView {
                             // Reset and start again
                             s.calib_a = Some((rx, ry));
                             s.calib_b = None;
+                        }
+                    }
+                    DrawMode::Select => {
+                        let (cx, cy) = widget_to_canvas(&s, x, y);
+                        let origin = s.origin.map(|(rx, ry)| (rx * mw, ry * mh)).unwrap_or((0.0, 0.0));
+                        let px_step = grid_px_step(s.scale_px_per_m, s.measurement_grid_spacing_m);
+                        let (cell_x, cell_y) = cell_anchor(cx, cy, px_step, origin);
+                        // Nearest measurement within the clicked cell
+                        let mut best: Option<(String, f64)> = None;
+                        for m in &s.measurements {
+                            let (mpx, mpy) = (m.x * mw, m.y * mh);
+                            let (mcx, mcy) = cell_anchor(mpx, mpy, px_step, origin);
+                            if mcx == cell_x && mcy == cell_y {
+                                let d = ((mpx - cx).powi(2) + (mpy - cy).powi(2)).sqrt();
+                                if best.as_ref().map_or(true, |(_, bd)| d < *bd) {
+                                    best = Some((m.id.clone(), d));
+                                }
+                            }
+                        }
+                        let id = best.map(|(id, _)| id);
+                        s.selected_measurement_id = id.clone();
+                        let cb = s.on_select_measurement.clone();
+                        drop(s);
+                        if let Some(cb) = cb {
+                            cb(id);
                         }
                     }
                 }
@@ -751,6 +785,22 @@ impl FloorPlanView {
         self.state.borrow_mut().on_origin_set = Some(Rc::new(cb));
     }
 
+    pub fn set_on_select_measurement<F: Fn(Option<String>) + 'static>(&self, cb: F) {
+        self.state.borrow_mut().on_select_measurement = Some(Rc::new(cb));
+    }
+
+    /// Set (or clear, with `None`) the currently selected measurement.
+    pub fn set_selected_measurement(&self, id: Option<String>) {
+        let mut s = self.state.borrow_mut();
+        s.selected_measurement_id = id;
+        drop(s);
+        self.widget.queue_draw();
+    }
+
+    pub fn get_selected_measurement(&self) -> Option<String> {
+        self.state.borrow().selected_measurement_id.clone()
+    }
+
     // ── Zoom ───────────────────────────────────────────────────────────────
 
     /// Zoom in (1.25×), centred on the widget centre.
@@ -913,6 +963,11 @@ fn draw_all(state: &FloorPlanState, ctx: &Context, w: i32, h: i32) {
         draw_measurement_cells(ctx, map_w, map_h, &state.measurements, state.scale_px_per_m, state.measurement_grid_spacing_m, state.color_metric, state.color_min, state.color_max, origin);
     }
 
+    // 5.5 Selected measurement highlight (inspect mode)
+    if state.selected_measurement_id.is_some() {
+        draw_selection(ctx, map_w, map_h, state);
+    }
+
     // 6. Calibration visualization
     draw_calibration(ctx, map_w, map_h, state);
 
@@ -1043,6 +1098,35 @@ fn draw_measurement_cells(
         ctx.rectangle(cell_x, cell_y, px_step, px_step);
         ctx.stroke().unwrap();
     }
+    ctx.restore().unwrap();
+}
+
+/// Draw a highlight around the selected measurement: outline its cell and
+/// mark the exact point, so it can be found at a glance (inspect mode).
+fn draw_selection(ctx: &Context, map_w: f64, map_h: f64, state: &FloorPlanState) {
+    let Some(ref id) = state.selected_measurement_id else { return };
+    let Some(m) = state.measurements.iter().find(|m| &m.id == id) else { return };
+    let px = m.x * map_w;
+    let py = m.y * map_h;
+    let origin = state.origin.map(|(rx, ry)| (rx * map_w, ry * map_h)).unwrap_or((0.0, 0.0));
+    let px_step = grid_px_step(state.scale_px_per_m, state.measurement_grid_spacing_m);
+    let (cell_x, cell_y) = cell_anchor(px, py, px_step, origin);
+
+    ctx.save().unwrap();
+    // Cell outline
+    ctx.set_source_rgba(0.25, 0.65, 1.0, 0.95);
+    ctx.set_line_width(2.5);
+    let inset = (px_step - 2.0).max(1.0);
+    ctx.rectangle(cell_x + 1.0, cell_y + 1.0, inset, inset);
+    ctx.stroke().unwrap();
+    // Point marker
+    ctx.set_source_rgba(1.0, 1.0, 1.0, 0.95);
+    ctx.arc(px, py, 5.0, 0.0, std::f64::consts::TAU);
+    ctx.fill().unwrap();
+    ctx.set_source_rgba(0.25, 0.65, 1.0, 0.95);
+    ctx.set_line_width(1.5);
+    ctx.arc(px, py, 5.0, 0.0, std::f64::consts::TAU);
+    ctx.stroke().unwrap();
     ctx.restore().unwrap();
 }
 

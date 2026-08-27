@@ -122,6 +122,9 @@ fn load_floor_into_view(
     fp.set_image("");
     fp.clear_canvas();
     fp.clear_calibration();
+    // Selection is transient; clear it when switching/loading a floor.
+    fp.set_selected_measurement(None);
+    panel.set_selected_by_id(None);
     if let Some(ref p) = floor.image_path {
         if p.to_lowercase().ends_with(".pdf") {
             fp.set_pdf(p, floor.pdf_page.unwrap_or(0));
@@ -287,6 +290,11 @@ fn build_ui(
         .tooltip_text("Set origin (0, 0) — click to place")
         .group(&mode_measure)
         .build();
+    let mode_select = ToggleButton::builder()
+        .icon_name("focus-symbolic")
+        .tooltip_text("Select mode (click a point to inspect a measurement)")
+        .group(&mode_measure)
+        .build();
 
     let clear_canvas_btn = Button::builder()
         .icon_name("edit-clear-symbolic")
@@ -330,6 +338,7 @@ fn build_ui(
     draw_bar.append(&mode_draw);
     draw_bar.append(&mode_calib);
     draw_bar.append(&mode_origin);
+    draw_bar.append(&mode_select);
     draw_bar.append(&Separator::new(Orientation::Vertical));
     draw_bar.append(&clear_canvas_btn);
     draw_bar.append(&Separator::new(Orientation::Vertical));
@@ -403,6 +412,12 @@ fn build_ui(
         let fp = floor_plan.clone();
         mode_origin.connect_toggled(move |btn| {
             if btn.is_active() { fp.set_draw_mode(DrawMode::SetOrigin); }
+        });
+    }
+    {
+        let fp = floor_plan.clone();
+        mode_select.connect_toggled(move |btn| {
+            if btn.is_active() { fp.set_draw_mode(DrawMode::Select); }
         });
     }
 
@@ -648,6 +663,23 @@ fn build_ui(
         });
     }
 
+    // Measurement selection: two-way correlation between map and list
+    {
+        let panel = panel.clone();
+        floor_plan.set_on_select_measurement(move |id| {
+            panel.set_selected_by_id(id);
+        });
+    }
+    {
+        let fp = floor_plan.clone();
+        let panel = panel.clone();
+        let panel_cb = panel.clone();
+        panel.set_on_row_clicked(move |id| {
+            fp.set_selected_measurement(Some(id.clone()));
+            panel_cb.set_selected_by_id(Some(id));
+        });
+    }
+
     // Delete measurement
     {
         let state = state.clone();
@@ -656,6 +688,7 @@ fn build_ui(
         let panel2 = panel.clone();
         let legend = legend.clone();
         panel.set_on_delete(move |id| {
+            let was_selected = fp.get_selected_measurement().as_deref() == Some(id.as_str());
             let measurements = {
                 let mut s = state.borrow_mut();
                 let idx = s.current_floor;
@@ -666,9 +699,15 @@ fn build_ui(
                     return;
                 }
             };
+            if was_selected {
+                fp.set_selected_measurement(None);
+            }
             fp.set_measurements(measurements.clone());
             legend.set_measurements(&measurements);
             panel2.set_measurements(measurements);
+            if was_selected {
+                panel2.set_selected_by_id(None);
+            }
             auto_save(&fp, &state);
         });
     }
@@ -722,6 +761,8 @@ fn build_ui(
                         fp2.set_measurements(vec![]);
                         legend2.set_measurements(&[]);
                         panel2.set_measurements(vec![]);
+                        fp2.set_selected_measurement(None);
+                        panel2.set_selected_by_id(None);
                         auto_save(&fp2, &state2);
                         overlay2.add_toast(Toast::new("Measurements deleted"));
                     }
@@ -735,6 +776,8 @@ fn build_ui(
                         fp2.set_measurements(vec![]);
                         legend2.set_measurements(&[]);
                         panel2.set_measurements(vec![]);
+                        fp2.set_selected_measurement(None);
+                        panel2.set_selected_by_id(None);
                         auto_save(&fp2, &state2);
                         overlay2.add_toast(Toast::new("All measurements deleted"));
                     }
