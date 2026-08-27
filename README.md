@@ -52,7 +52,9 @@ Here is a summary of the changes made:
 
 ## Screenshots
 
-> _Add screenshots here_
+<p align="center">
+  <img src="data/screenshots/screenshot_1.png" width="800" alt="WiFi Checker — floor plan heatmap with the side panel (Current Signal, Selected Measurement, Measurements list)"/>
+</p>
 
 ---
 
