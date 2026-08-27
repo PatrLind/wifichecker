@@ -29,6 +29,10 @@ trait NetworkManager {
 trait NMDevice {
     #[zbus(property)]
     fn device_type(&self) -> zbus::Result<u32>;
+
+    /// The device's primary network interface name (e.g. "wlan0").
+    #[zbus(property)]
+    fn interface(&self) -> zbus::Result<String>;
 }
 
 #[zbus::proxy(
@@ -61,12 +65,11 @@ trait NMAccessPoint {
     fn max_bitrate(&self) -> zbus::Result<u32>;
 }
 
-/// Query the active WiFi access point via the NetworkManager D-Bus API.
-///
-/// Iterates over all NM devices, finds the first WiFi device, and reads the
-/// properties of its active access point.  Returns `Ok(None)` when no WiFi
-/// device is active.
-pub fn query_active_ap() -> Result<Option<WifiInfo>> {
+/// Query all WiFi devices that currently have an active access point, via the
+/// NetworkManager D-Bus API. Each returned `WifiInfo` carries the device's
+/// interface name (e.g. `wlan0`) in `device`, so the UI can show which card is
+/// in use and let the user choose between multiple cards.
+pub fn query_active_wifi_devices() -> Result<Vec<WifiInfo>> {
     let conn = Connection::system().context("Failed to connect to system D-Bus")?;
 
     let nm = NetworkManagerProxyBlocking::new(&conn)
@@ -76,6 +79,7 @@ pub fn query_active_ap() -> Result<Option<WifiInfo>> {
         .get_all_devices()
         .context("NetworkManager.GetAllDevices failed")?;
 
+    let mut result = Vec::new();
     for device_path in devices {
         let device = NMDeviceProxyBlocking::builder(&conn)
             .path(device_path.as_str())?
@@ -119,17 +123,29 @@ pub fn query_active_ap() -> Result<Option<WifiInfo>> {
         let link_speed_mbps =
             if max_bitrate_kbps > 0 { Some(max_bitrate_kbps / 1000) } else { None };
 
-        return Ok(Some(WifiInfo {
+        // Identify the card by its interface name (e.g. "wlan0"); fall back to
+        // the AP's BSSID if the interface name is unavailable.
+        let iface = device.interface().unwrap_or_default();
+        let device_name = if iface.is_empty() { bssid.clone() } else { iface };
+
+        result.push(WifiInfo {
             ssid,
             bssid,
             frequency_mhz,
             channel,
             signal_dbm,
             link_speed_mbps,
-        }));
+            device: device_name,
+        });
     }
 
-    Ok(None)
+    Ok(result)
+}
+
+/// Query the active WiFi access point (the first active WiFi card). Kept for
+/// callers that only need a single connection.
+pub fn query_active_ap() -> Result<Option<WifiInfo>> {
+    Ok(query_active_wifi_devices()?.into_iter().next())
 }
 
 /// Convert a WiFi frequency in MHz to an 802.11 channel number.

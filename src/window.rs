@@ -129,7 +129,10 @@ fn known_ssids(state: &Rc<RefCell<AppState>>) -> Vec<String> {
     let mut v: Vec<String> = Vec::new();
     if let Some(floor) = s.project.floors.get(s.current_floor) {
         for m in &floor.measurements {
-            if !v.contains(&m.ssid) {
+            if m.no_signal {
+                continue; // no-signal points have no SSID
+            }
+            if !m.ssid.is_empty() && !v.contains(&m.ssid) {
                 v.push(m.ssid.clone());
             }
         }
@@ -146,6 +149,18 @@ fn format_new_network_warning(ssid: &str, known: &[String]) -> String {
         format!("{} networks", known.len())
     };
     format!("⚠ New network: \"{ssid}\" (this floor has: {known_str})")
+}
+
+/// Index of the WiFi card to measure: the preferred card if it is currently
+/// active, otherwise the first active card.
+fn pick_card_index(preferred: &Option<String>, cards: &[WifiInfo]) -> Option<usize> {
+    if cards.is_empty() {
+        return None;
+    }
+    Some(match preferred {
+        Some(p) => cards.iter().position(|c| &c.device == p).unwrap_or(0),
+        None => 0,
+    })
 }
 
 /// Show a confirm dialog when the user tries to measure on a network that
@@ -180,6 +195,62 @@ fn show_new_network_confirm(
     dialog.choose(gtk4::gio::Cancellable::NONE, move |resp| {
         on_response(resp.as_str() == "ok");
     });
+}
+
+/// Show a confirm dialog when no WiFi connection is detected at the
+/// measurement point. Invokes `on_response(true)` to record a "no signal"
+/// point (marking a dead zone) and `on_response(false)` to cancel.
+fn show_no_signal_confirm(
+    window: &libadwaita::ApplicationWindow,
+    on_response: impl FnOnce(bool) + 'static,
+) {
+    let dialog = libadwaita::MessageDialog::builder()
+        .heading("No WiFi connection")
+        .body("No WiFi connection was detected at this point.\n\nRecord it as a \"no signal\" point to mark this as a dead zone?")
+        .default_response("cancel")
+        .close_response("cancel")
+        .transient_for(window)
+        .modal(true)
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("ok", "Record 'no signal'");
+    dialog.set_response_appearance("ok", libadwaita::ResponseAppearance::Suggested);
+    dialog.choose(gtk4::gio::Cancellable::NONE, move |resp| {
+        on_response(resp.as_str() == "ok");
+    });
+}
+
+/// Record a "no signal" measurement at a position and update the UI.
+fn record_no_signal_point(
+    rx: f64,
+    ry: f64,
+    state: &Rc<RefCell<AppState>>,
+    fp: &FloorPlanView,
+    legend: &LegendBar,
+    panel: &MeasurementPanel,
+    overlay: &ToastOverlay,
+) {
+    let m = Measurement::no_signal(rx, ry);
+    let new_id = m.id.clone();
+    let (measurements, panel_measurements) = {
+        let mut s = state.borrow_mut();
+        let idx = s.current_floor;
+        if let Some(floor) = s.project.floors.get_mut(idx) {
+            floor.add_measurement(m);
+            let measurements = floor.measurements.clone();
+            (measurements.clone(), measurements)
+        } else {
+            return;
+        }
+    };
+    fp.set_measurements(measurements.clone());
+    legend.set_measurements(&measurements);
+    panel.set_measurements(panel_measurements);
+    fp.set_selected_measurement(Some(new_id.clone()));
+    legend.set_selected_measurement(measurements.iter().find(|mm| mm.id == new_id).cloned());
+    panel.set_selected_by_id(Some(new_id.clone()));
+    auto_save(fp, state);
+    overlay.add_toast(Toast::new("Recorded \"no signal\" point"));
 }
 
 /// Load a floor's data (image, canvas, calibration, measurements) into the
@@ -627,6 +698,7 @@ fn build_ui(
             let overlay_ref = overlay_ref.clone();
             let settings = settings.clone();
             let legend = legend.clone();
+            let window = window.clone();
             let measuring = measuring.clone();
             move |rx: f64, ry: f64| {
             // Block new measurements while one is in progress.
@@ -660,9 +732,11 @@ fn build_ui(
             };
             panel2.set_measuring(true, status_msg);
 
+            let preferred_device = settings.borrow().wifi_device.clone();
             let (tx, recv) = async_channel::bounded::<MeasureResult>(1);
             std::thread::spawn(move || {
-                let wifi = WifiScanner::scan().ok().flatten();
+                let cards = WifiScanner::scan_all().unwrap_or_default();
+                let wifi = pick_card_index(&preferred_device, &cards).and_then(|i| cards.get(i).cloned());
 
                 let (iperf_mbps, iperf_error) = if iperf_enabled && !iperf_server.is_empty() {
                     match IperfClient::new(&iperf_server, iperf_port, iperf_dur, iperf_streams).run_test() {
@@ -694,6 +768,7 @@ fn build_ui(
             let overlay2 = overlay_ref.clone();
             let legend2 = legend.clone();
             let measuring2 = measuring.clone();
+            let window2 = window.clone();
 
             glib::spawn_future_local(async move {
                 let Ok(result) = recv.recv().await else {
@@ -705,9 +780,7 @@ fn build_ui(
                 panel3.set_measuring(false, "");
 
                 let Some(info) = result.wifi else {
-                    *measuring2.borrow_mut() = false;
-                    fp2.set_pending_measurement(None);
-                    overlay2.add_toast(Toast::new("No active WiFi connection"));
+                    let (rx, ry) = (result.rx, result.ry);
                     // Still surface speed-test errors even without WiFi
                     if let Some(ref e) = result.iperf_error {
                         overlay2.add_toast(Toast::new(&format!("iperf3 error: {e}")));
@@ -715,6 +788,20 @@ fn build_ui(
                     if let Some(ref e) = result.smb_error {
                         overlay2.add_toast(Toast::new(&format!("Samba error: {e}")));
                     }
+                    // Offer to record this point as "no signal" (WiFi off / not
+                    // connected) so the user can mark dead zones.
+                    let state3 = state2.clone();
+                    let fp3 = fp2.clone();
+                    let legend3 = legend2.clone();
+                    let panel4 = panel3.clone();
+                    let overlay3 = overlay2.clone();
+                    show_no_signal_confirm(&window2, move |ok| {
+                        if ok {
+                            record_no_signal_point(rx, ry, &state3, &fp3, &legend3, &panel4, &overlay3);
+                        }
+                    });
+                    *measuring2.borrow_mut() = false;
+                    fp2.set_pending_measurement(None);
                     return;
                 };
 
@@ -756,6 +843,7 @@ fn build_ui(
                 panel3.update_current_wifi(
                     &info.ssid, &info.bssid,
                     info.signal_dbm, info.frequency_mhz, info.channel,
+                    &info.device,
                     result.iperf_mbps, result.smb_mbps, unit,
                 );
                 legend2.set_current_signal(Some(info.signal_dbm as f64));
@@ -776,6 +864,7 @@ fn build_ui(
             }
         });
 
+        let wifi_settings = settings.clone();
         floor_plan.set_on_measure_click(move |rx, ry| {
             // Block new measurements while one is in progress.
             if *measuring.borrow() {
@@ -793,8 +882,12 @@ fn build_ui(
             // current SSID, then (on the main thread, deferred out of the
             // drag/pointer-grab context) confirm if it is a new network.
             let (tx, rchan) = async_channel::bounded(1);
+            let preferred = wifi_settings.borrow().wifi_device.clone();
             std::thread::spawn(move || {
-                let cur = WifiScanner::scan().ok().flatten().map(|w| w.ssid);
+                let cards = WifiScanner::scan_all().unwrap_or_default();
+                let cur = pick_card_index(&preferred, &cards)
+                    .and_then(|i| cards.get(i).cloned())
+                    .map(|w| w.ssid);
                 let _ = tx.send_blocking((cur, known));
             });
             let start = start_measurement.clone();
@@ -913,6 +1006,16 @@ fn build_ui(
             panel_cb.set_selected_by_id(Some(id));
         });
     }
+    // Remember the chosen WiFi card when the user switches it in the selector.
+    {
+        let settings = settings.clone();
+        let ov = overlay.clone();
+        panel.set_on_device_changed(move |device: String| {
+            settings.borrow_mut().wifi_device = Some(device.clone());
+            let _ = SettingsStore::save(&settings.borrow());
+            ov.add_toast(Toast::new(&format!("Measuring card: {device}")));
+        });
+    }
 
     // Live Current Signal: periodically refresh with the active WiFi AP.
     {
@@ -920,26 +1023,51 @@ fn build_ui(
         let legend = legend.clone();
         let state = state.clone();
         let overlay = overlay.clone();
+        let settings = settings.clone();
         // Tracks whether the "new network" warning is currently shown, so the
         // toast only fires on the transition into a mismatch (not every tick).
         let off_flag: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+        // Tracks whether the "preferred card unavailable" warning is shown.
+        let pref_flag: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
         let _ = glib::timeout_add_local(std::time::Duration::from_millis(1500), move || {
             let p = panel.clone();
             let lg = legend.clone();
             let st = state.clone();
             let ov = overlay.clone();
             let off = off_flag.clone();
+            let pref = pref_flag.clone();
+            let preferred = settings.borrow().wifi_device.clone();
             let (tx, rx) = async_channel::bounded(1);
-            std::thread::spawn(move || {
-                let info = WifiScanner::scan().ok().flatten();
-                let _ = tx.send_blocking(info);
-            });
+            {
+                let pt = preferred.clone();
+                std::thread::spawn(move || {
+                    let cards = WifiScanner::scan_all().unwrap_or_default();
+                    let chosen = pick_card_index(&pt, &cards);
+                    let info = chosen.and_then(|i| cards.get(i).cloned());
+                    let _ = tx.send_blocking((cards, info));
+                });
+            }
             glib::spawn_future_local(async move {
-                let Ok(info) = rx.recv().await else { return };
+                let Ok((cards, info)) = rx.recv().await else { return };
                 match info {
                     Some(w) => {
-                        p.refresh_live_signal(&w.ssid, &w.bssid, w.signal_dbm, w.frequency_mhz, w.channel);
+                        p.refresh_live_signal(&w.ssid, &w.bssid, w.signal_dbm, w.frequency_mhz, w.channel, &w.device);
                         lg.set_current_signal(Some(w.signal_dbm as f64));
+                        // Show the card selector when more than one card is active.
+                        let opts: Vec<String> = cards.iter().map(|c| c.device.clone()).collect();
+                        p.set_card_selector(&opts, Some(w.device.as_str()));
+                        // Warn (on transition) if the preferred card is no longer active.
+                        let pref_missing = preferred.as_ref()
+                            .map(|pn| !cards.iter().any(|c| &c.device == pn))
+                            .unwrap_or(false);
+                        if pref_missing && !*pref.borrow() {
+                            *pref.borrow_mut() = true;
+                            if let Some(pn) = preferred.as_ref() {
+                                ov.add_toast(Toast::new(&format!("Card {pn} unavailable — using {}", w.device)));
+                            }
+                        } else if !pref_missing {
+                            *pref.borrow_mut() = false;
+                        }
                         // Warn if we're on a network not yet measured on this floor.
                         let known = known_ssids(&st);
                         let msg = if !known.is_empty() && !known.contains(&w.ssid) {
@@ -962,6 +1090,7 @@ fn build_ui(
                         lg.set_current_signal(None);
                         p.set_network_warning(None);
                         *off.borrow_mut() = false;
+                        *pref.borrow_mut() = false;
                     }
                 }
             });

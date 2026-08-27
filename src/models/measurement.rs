@@ -20,6 +20,10 @@ pub struct Measurement {
     pub link_speed_mbps: Option<u32>,
     pub iperf_mbps: Option<f64>,
     pub smb_mbps: Option<f64>,
+    /// True when this point records "no WiFi reception" (WiFi off or not
+    /// connected) — used to mark dead zones on the coverage map.
+    #[serde(default)]
+    pub no_signal: bool,
 }
 
 impl Measurement {
@@ -38,6 +42,28 @@ impl Measurement {
             link_speed_mbps: None,
             iperf_mbps: None,
             smb_mbps: None,
+            no_signal: false,
+        }
+    }
+
+    /// A measurement recording "no WiFi reception" at a position (WiFi off or
+    /// not connected). Marks a dead zone on the coverage map.
+    pub fn no_signal(x: f64, y: f64) -> Self {
+        Self {
+            id: uuid_v4(),
+            x,
+            y,
+            timestamp: Utc::now(),
+            ssid: String::new(),
+            bssid: String::new(),
+            frequency_mhz: 0,
+            channel: 0,
+            signal_dbm: -90,
+            noise_dbm: None,
+            link_speed_mbps: None,
+            iperf_mbps: None,
+            smb_mbps: None,
+            no_signal: true,
         }
     }
 
@@ -125,6 +151,33 @@ mod tests {
         assert_eq!(m.signal_dbm, -65);
         assert_eq!(m.ssid, "SSID");
         assert_eq!(m.bssid, "AA:BB:CC:DD:EE:FF");
+    }
+
+    #[test]
+    fn test_no_signal_measurement() {
+        let m = Measurement::no_signal(0.2, 0.8);
+        assert!(m.no_signal);
+        assert_eq!(m.x, 0.2);
+        assert_eq!(m.y, 0.8);
+        assert!(m.ssid.is_empty());
+        assert!(m.bssid.is_empty());
+        assert_eq!(m.signal_dbm, -90);
+        assert!(m.iperf_mbps.is_none());
+        assert!(m.smb_mbps.is_none());
+    }
+
+    #[test]
+    fn test_regular_measurement_is_not_no_signal() {
+        let m = make_measurement(-60);
+        assert!(!m.no_signal);
+    }
+
+    #[test]
+    fn test_no_signal_deserializes_from_old_data_without_field() {
+        // Old saved projects have no `no_signal` field; it should default to false.
+        let json = r#"{"id":"x","x":0.5,"y":0.5,"timestamp":"2024-01-01T00:00:00Z","ssid":"A","bssid":"B","frequency_mhz":2412,"channel":1,"signal_dbm":-70,"noise_dbm":null,"link_speed_mbps":null,"iperf_mbps":null,"smb_mbps":null}"#;
+        let m: Measurement = serde_json::from_str(json).unwrap();
+        assert!(!m.no_signal);
     }
 
     #[test]

@@ -51,16 +51,18 @@ impl LegendBar {
                 // Value the pointer marks: the selected measurement's value, or
                 // (when nothing is selected, or it lacks the metric's value) the
                 // live current signal for the signal-strength metric.
-                let marker_val = s.selected
-                    .as_ref()
-                    .and_then(|m| metric_value(m, s.metric))
-                    .or_else(|| {
+                let marker_val = match s.selected.as_ref() {
+                    // A no-signal point has no value on the scale -> no marker.
+                    Some(m) if m.no_signal => None,
+                    Some(m) => metric_value(m, s.metric),
+                    None => {
                         if s.metric == ColorMetric::SignalDbm {
                             s.current_signal_dbm
                         } else {
                             None
                         }
-                    });
+                    }
+                };
                 draw_legend(ctx, w as f64, h as f64, s.metric, s.min, s.max, marker_val);
             });
         }

@@ -10,6 +10,11 @@ pub struct MeasurementPanel {
     pub widget: GtkBox,
     current_label: Label,
     network_warn: Label,
+    device_row: GtkBox,
+    device_combo: gtk4::ComboBoxText,
+    expected_device_active: Rc<RefCell<Option<u32>>>,
+    last_device_options: Rc<RefCell<Vec<String>>>,
+    on_device_changed: Rc<RefCell<Option<Box<dyn Fn(String)>>>>,
     selected_label: Label,
     status_box: GtkBox,
     spinner: Spinner,
@@ -48,9 +53,41 @@ impl MeasurementPanel {
         network_warn.add_css_class("warning");
         network_warn.set_visible(false);
 
+        // WiFi card selector (shown only when 2 or more cards are active).
+        let device_row = GtkBox::new(Orientation::Horizontal, 6);
+        device_row.set_margin_start(4);
+        device_row.set_visible(false);
+        let device_caption = Label::new(Some("Measure card:"));
+        device_caption.add_css_class("caption");
+        let device_combo = gtk4::ComboBoxText::new();
+        device_row.append(&device_caption);
+        device_row.append(&device_combo);
+
+        let expected_device_active = Rc::new(RefCell::new(None::<u32>));
+        let last_device_options = Rc::new(RefCell::new(Vec::<String>::new()));
+        let on_device_changed: Rc<RefCell<Option<Box<dyn Fn(String)>>>> = Rc::new(RefCell::new(None));
+        {
+            let expected = expected_device_active.clone();
+            let combo_ref = device_combo.clone();
+            let cb_ref = on_device_changed.clone();
+            device_combo.connect_changed(move |_| {
+                let active = combo_ref.active();
+                if active == *expected.borrow() {
+                    return; // programmatic update, not a user choice
+                }
+                *expected.borrow_mut() = active;
+                if let Some(text) = combo_ref.active_text() {
+                    if let Some(ref cb) = *cb_ref.borrow() {
+                        cb(text.to_string());
+                    }
+                }
+            });
+        }
+
         let current_group = libadwaita::PreferencesGroup::new();
         current_group.set_title("Current Signal");
         current_group.add(&current_label);
+        current_group.add(&device_row);
         current_group.add(&network_warn);
         vbox.append(&current_group);
 
@@ -136,6 +173,11 @@ impl MeasurementPanel {
             widget: vbox,
             current_label,
             network_warn,
+            device_row,
+            device_combo,
+            expected_device_active,
+            last_device_options,
+            on_device_changed,
             selected_label,
             status_box,
             spinner,
@@ -171,6 +213,7 @@ impl MeasurementPanel {
         dbm: i32,
         freq: u32,
         channel: u8,
+        device: &str,
         iperf_mbps: Option<f64>,
         smb_mbps: Option<f64>,
         unit: ThroughputUnit,
@@ -178,8 +221,8 @@ impl MeasurementPanel {
         let band = if freq >= 5000 { "5 GHz" } else { "2.4 GHz" };
         let quality = signal_quality_str(dbm);
         let mut text = format!(
-            "SSID: {}\nBSSID: {}\nSignal: {} dBm ({})\nBand: {} | Ch: {}",
-            ssid, bssid, dbm, quality, band, channel
+            "SSID: {}\nBSSID: {}\nSignal: {} dBm ({})\nBand: {} | Ch: {}\nCard: {}",
+            ssid, bssid, dbm, quality, band, channel, device
         );
         if let Some(mbps) = iperf_mbps {
             text.push_str(&format!("\niperf3: {}", unit.format(mbps)));
@@ -192,6 +235,7 @@ impl MeasurementPanel {
 
     pub fn set_no_wifi(&self) {
         self.current_label.set_label("No WiFi connection detected");
+        self.device_row.set_visible(false);
     }
 
     /// Show/hide a warning that the current SSID is not one of this floor's
@@ -208,8 +252,41 @@ impl MeasurementPanel {
 
     /// Refresh the live Current Signal with the active AP. No throughput is
     /// shown — that only appears right after a measurement (update_current_wifi).
-    pub fn refresh_live_signal(&self, ssid: &str, bssid: &str, dbm: i32, freq: u32, channel: u8) {
-        self.update_current_wifi(ssid, bssid, dbm, freq, channel, None, None, *self.unit.borrow());
+    pub fn refresh_live_signal(&self, ssid: &str, bssid: &str, dbm: i32, freq: u32, channel: u8, device: &str) {
+        self.update_current_wifi(ssid, bssid, dbm, freq, channel, device, None, None, *self.unit.borrow());
+    }
+
+    pub fn set_on_device_changed<F: Fn(String) + 'static>(&self, cb: F) {
+        *self.on_device_changed.borrow_mut() = Some(Box::new(cb));
+    }
+
+    /// Show/hide the WiFi card selector. `options` is the list of active card
+    /// interface names; the selector is shown only when there are two or more.
+    /// `selected` is the card currently in use (highlighted in the combo).
+    pub fn set_card_selector(&self, options: &[String], selected: Option<&str>) {
+        if options.len() < 2 {
+            self.device_row.set_visible(false);
+            return;
+        }
+        // Repopulate the combo only if the set of options changed.
+        if *self.last_device_options.borrow() != options.to_vec() {
+            *self.expected_device_active.borrow_mut() = None; // ignore spurious `changed`
+            self.device_combo.remove_all();
+            for opt in options {
+                self.device_combo.append_text(opt);
+            }
+            *self.last_device_options.borrow_mut() = options.to_vec();
+        }
+        // Highlight the card currently in use.
+        let target: Option<u32> = selected
+            .and_then(|sel| options.iter().position(|o| o == sel))
+            .map(|p| p as u32)
+            .or(Some(0));
+        *self.expected_device_active.borrow_mut() = target;
+        if self.device_combo.active() != target {
+            self.device_combo.set_active(target);
+        }
+        self.device_row.set_visible(true);
     }
 
     pub fn set_measurements(&self, measurements: Vec<Measurement>) {
@@ -288,16 +365,21 @@ impl MeasurementPanel {
         hbox.set_margin_top(4);
         hbox.set_margin_bottom(4);
 
-        let mut info_str = format!(
-            "{} | {} dBm | {}",
-            m.ssid, m.signal_dbm,
-            m.timestamp.format("%H:%M:%S")
-        );
-        if let Some(mbps) = m.iperf_mbps {
-            info_str.push_str(&format!(" | ⚡{}", self.unit.borrow().format_short(mbps)));
-        } else if let Some(mbps) = m.smb_mbps {
-            info_str.push_str(&format!(" | 🗂{}", self.unit.borrow().format_short(mbps)));
-        }
+        let info_str = if m.no_signal {
+            format!("⚫ No signal | {}", m.timestamp.format("%H:%M:%S"))
+        } else {
+            let mut s = format!(
+                "{} | {} dBm | {}",
+                m.ssid, m.signal_dbm,
+                m.timestamp.format("%H:%M:%S")
+            );
+            if let Some(mbps) = m.iperf_mbps {
+                s.push_str(&format!(" | ⚡{}", self.unit.borrow().format_short(mbps)));
+            } else if let Some(mbps) = m.smb_mbps {
+                s.push_str(&format!(" | 🗂{}", self.unit.borrow().format_short(mbps)));
+            }
+            s
+        };
 
         let info = Label::new(Some(&info_str));
         info.set_hexpand(true);
@@ -336,6 +418,12 @@ fn signal_quality_str(dbm: i32) -> &'static str {
 }
 
 fn format_measurement_details(m: &Measurement, unit: &ThroughputUnit) -> String {
+    if m.no_signal {
+        return format!(
+            "No signal (dead zone)\nTime: {}",
+            m.timestamp.format("%m-%d %H:%M:%S")
+        );
+    }
     let band = if m.frequency_mhz >= 5000 { "5 GHz" } else { "2.4 GHz" };
     let mut text = format!(
         "SSID: {}\nBSSID: {}\nSignal: {} dBm ({})\nBand: {} | Ch: {} | {} MHz\nTime: {}",

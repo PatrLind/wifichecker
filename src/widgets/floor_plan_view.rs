@@ -1158,15 +1158,20 @@ fn draw_measurement_cells(
     let (ox, oy) = origin.unwrap_or((0.0, 0.0));
     ctx.save().unwrap();
     for m in measurements {
-        let val = match metric_value(m, metric) {
-            Some(v) => v,
-            None => continue,
-        };
         let px = m.x * w;
         let py = m.y * h;
         // The measurement is stored at cell center; find its cell (anchored to the origin).
         let (cell_x, cell_y) = cell_anchor(px, py, px_step, (ox, oy));
-        let (r, g, b) = value_color(val, min, max);
+        // A no-signal point is "no data" — a neutral gray, not the worst
+        // (red) colour on the scale. Regular samples use the metric colour.
+        let (r, g, b) = if m.no_signal {
+            (0.5, 0.5, 0.5)
+        } else {
+            match metric_value(m, metric) {
+                Some(v) => value_color(v, min, max),
+                None => continue,
+            }
+        };
         ctx.set_source_rgba(r, g, b, 0.72);
         ctx.rectangle(cell_x, cell_y, px_step, px_step);
         ctx.fill().unwrap();

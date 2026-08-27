@@ -56,6 +56,11 @@ impl ColorMetric {
 
 /// The value of a measurement for a given metric, if that metric is present.
 pub fn metric_value(m: &Measurement, metric: ColorMetric) -> Option<f64> {
+    // A no-signal point has no reading to place on the scale — it is "no
+    // data", not the worst signal — so it contributes no value.
+    if m.no_signal {
+        return None;
+    }
     match metric {
         ColorMetric::SmbMbps   => m.smb_mbps,
         ColorMetric::IperfMbps => m.iperf_mbps,
@@ -87,6 +92,15 @@ mod tests {
     fn reference_range_bandwidth_is_1_gbit() {
         assert_eq!(ColorMetric::IperfMbps.reference_range(), (0.0, 1000.0));
         assert_eq!(ColorMetric::SmbMbps.reference_range(), (0.0, 1000.0));
+    }
+
+    #[test]
+    fn metric_value_no_signal_is_none() {
+        let m = Measurement::no_signal(0.5, 0.5);
+        // No-signal points have no value on the scale (they are "no data").
+        assert_eq!(metric_value(&m, ColorMetric::SignalDbm), None);
+        assert_eq!(metric_value(&m, ColorMetric::IperfMbps), None);
+        assert_eq!(metric_value(&m, ColorMetric::SmbMbps), None);
     }
 
     #[test]

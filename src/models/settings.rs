@@ -61,6 +61,11 @@ pub struct AppSettings {
     /// Which measurement value the floor-plan cell colours are based on.
     pub color_metric: ColorMetric,
 
+    // WiFi
+    /// Preferred WiFi card interface to measure (e.g. "wlan0"). `None` means
+    /// auto (the first active card). Remembered across runs.
+    pub wifi_device: Option<String>,
+
     // UI state
     pub last_floor_index: usize,
 }
@@ -89,6 +94,8 @@ impl Default for AppSettings {
 
             throughput_unit: ThroughputUnit::Mbit,
             color_metric: ColorMetric::default(),
+
+            wifi_device: None,
 
             last_floor_index: 0,
         }

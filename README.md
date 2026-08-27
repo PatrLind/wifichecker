@@ -2,6 +2,7 @@
 
 This project is a fork of https://github.com/danst0/wifichecker.
 I used Qwen 3.8 27B to implement a few new features and fixed a few bugs so it would be a bit more useful for my particular usecase.
+Since these changes are "vide coded" I suggest you avoid using it. 
 Here is a summary of the changes made:
 
 - **Project save/load** – multiple floors, per-project drawings, auto-save, and a project menu (Open / Save As).
