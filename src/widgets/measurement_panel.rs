@@ -183,6 +183,12 @@ impl MeasurementPanel {
         self.current_label.set_label("No WiFi connection detected");
     }
 
+    /// Refresh the live Current Signal with the active AP. No throughput is
+    /// shown — that only appears right after a measurement (update_current_wifi).
+    pub fn refresh_live_signal(&self, ssid: &str, bssid: &str, dbm: i32, freq: u32, channel: u8) {
+        self.update_current_wifi(ssid, bssid, dbm, freq, channel, None, None, *self.unit.borrow());
+    }
+
     pub fn set_measurements(&self, measurements: Vec<Measurement>) {
         *self.measurements.borrow_mut() = measurements.clone();
         self.rebuild_list(&measurements);

@@ -554,6 +554,7 @@ fn build_ui(
                 );
                 m.iperf_mbps = result.iperf_mbps;
                 m.smb_mbps = result.smb_mbps;
+                let new_id = m.id.clone();
 
                 // Surface speed-test errors as toasts
                 if let Some(ref e) = result.iperf_error {
@@ -584,6 +585,9 @@ fn build_ui(
                     info.signal_dbm, info.frequency_mhz, info.channel,
                     result.iperf_mbps, result.smb_mbps, unit,
                 );
+                // Show the just-recorded sample in Selected Measurement + highlight it.
+                fp2.set_selected_measurement(Some(new_id.clone()));
+                panel3.set_selected_by_id(Some(new_id));
                 auto_save(&fp2, &state2);
                 let mut toast_msg = format!("{} dBm | {}", info.signal_dbm, info.ssid);
                 if let Some(mbps) = result.iperf_mbps {
@@ -677,6 +681,27 @@ fn build_ui(
         panel.set_on_row_clicked(move |id| {
             fp.set_selected_measurement(Some(id.clone()));
             panel_cb.set_selected_by_id(Some(id));
+        });
+    }
+
+    // Live Current Signal: periodically refresh with the active WiFi AP.
+    {
+        let panel = panel.clone();
+        let _ = glib::timeout_add_local(std::time::Duration::from_millis(1500), move || {
+            let p = panel.clone();
+            let (tx, rx) = async_channel::bounded(1);
+            std::thread::spawn(move || {
+                let info = WifiScanner::scan().ok().flatten();
+                let _ = tx.send_blocking(info);
+            });
+            glib::spawn_future_local(async move {
+                let Ok(info) = rx.recv().await else { return };
+                match info {
+                    Some(w) => p.refresh_live_signal(&w.ssid, &w.bssid, w.signal_dbm, w.frequency_mhz, w.channel),
+                    None => p.set_no_wifi(),
+                }
+            });
+            glib::ControlFlow::Continue
         });
     }
 
