@@ -226,8 +226,8 @@ impl FloorPlanView {
                             }
                         } else {
                             // Reset and start again
-                            state.borrow_mut().calib_a = Some((rx, ry));
-                            state.borrow_mut().calib_b = None;
+                            s.calib_a = Some((rx, ry));
+                            s.calib_b = None;
                         }
                     }
                 }
