@@ -11,7 +11,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FLATHUB_REPO="${1:-/home/danst/Skripte/flathub-wifichecker}"
-APP_ID="io.github.danst0.wifichecker"
+APP_ID="io.github.PatrLind.wifichecker"
 MANIFEST="$APP_ID.yml"
 
 # ── 1. Resolve version & tag ────────────────────────────────────────────────

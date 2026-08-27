@@ -9,7 +9,7 @@ mod window;
 use libadwaita::prelude::*;
 use libadwaita::Application;
 
-const APP_ID: &str = "io.github.danst0.wifichecker";
+const APP_ID: &str = "io.github.PatrLind.wifichecker";
 
 fn main() {
     env_logger::init();

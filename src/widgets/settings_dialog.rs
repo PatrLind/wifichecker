@@ -220,21 +220,21 @@ impl SettingsDialog {
 
         let source_row = ActionRow::new();
         source_row.set_title("Source Code");
-        source_row.set_subtitle("github.com/danst0/wifichecker");
+        source_row.set_subtitle("github.com/PatrLind/wifichecker");
         source_row.set_activatable(true);
         source_row.add_suffix(&gtk4::Image::from_icon_name("go-next-symbolic"));
         source_row.connect_activated(|_| {
-            gtk4::UriLauncher::new("https://github.com/danst0/wifichecker")
+            gtk4::UriLauncher::new("https://github.com/PatrLind/wifichecker")
                 .launch(gtk4::Window::NONE, gtk4::gio::Cancellable::NONE, |_| {});
         });
 
         let issues_row = ActionRow::new();
         issues_row.set_title("Report an Issue");
-        issues_row.set_subtitle("github.com/danst0/wifichecker/issues");
+        issues_row.set_subtitle("github.com/PatrLind/wifichecker/issues");
         issues_row.set_activatable(true);
         issues_row.add_suffix(&gtk4::Image::from_icon_name("go-next-symbolic"));
         issues_row.connect_activated(|_| {
-            gtk4::UriLauncher::new("https://github.com/danst0/wifichecker/issues")
+            gtk4::UriLauncher::new("https://github.com/PatrLind/wifichecker/issues")
                 .launch(gtk4::Window::NONE, gtk4::gio::Cancellable::NONE, |_| {});
         });
 

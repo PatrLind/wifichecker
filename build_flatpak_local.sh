@@ -10,7 +10,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-APP_ID="io.github.danst0.wifichecker"
+APP_ID="io.github.PatrLind.wifichecker"
 BUILD_DIR="$SCRIPT_DIR/.flatpak-build"
 REPO_DIR="$SCRIPT_DIR/.flatpak-repo"
 MANIFEST="$APP_ID.yml"

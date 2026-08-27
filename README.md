@@ -18,7 +18,7 @@ Here is a summary of the changes made:
 
 
 <p align="center">
-  <img src="data/icons/scalable/apps/io.github.danst0.wifichecker.png" width="128" alt="WiFi Checker icon"/>
+  <img src="data/icons/scalable/apps/io.github.PatrLind.wifichecker.png" width="128" alt="WiFi Checker icon"/>
 </p>
 
 <h1 align="center">WiFi Checker</h1>
@@ -29,9 +29,6 @@ Here is a summary of the changes made:
 </p>
 
 <p align="center">
-  <a href="https://github.com/danst0/wifichecker/actions/workflows/ci.yml">
-    <img src="https://github.com/danst0/wifichecker/actions/workflows/ci.yml/badge.svg" alt="CI/CD"/>
-  </a>
   <img src="https://img.shields.io/badge/platform-Linux-blue" alt="Platform: Linux"/>
   <img src="https://img.shields.io/badge/built%20with-Rust%20%2B%20GTK4-orange" alt="Rust + GTK4"/>
 </p>
@@ -61,15 +58,6 @@ Here is a summary of the changes made:
 
 ## Installation
 
-### Flatpak (recommended)
-
-Download the latest `.flatpak` bundle from the [Releases](https://github.com/danst0/wifichecker/releases) page and install it:
-
-```bash
-flatpak install wifichecker.flatpak
-flatpak run io.github.danst0.wifichecker
-```
-
 ### Build from source
 
 **Prerequisites**
@@ -90,13 +78,13 @@ sudo dnf install gtk4-devel libadwaita-devel NetworkManager
 
 On Debian/Ubuntu:
 ```bash
-sudo apt install libgtk-4-dev libadwaita-1-dev network-manager
+sudo apt install libgtk-4-dev libadwaita-1-dev libpoppler-glib-dev network-manager
 ```
 
 **Build & run**
 
 ```bash
-git clone https://github.com/danst0/wifichecker.git
+git clone https://github.com/PatrLind/wifichecker.git
 cd wifichecker
 cargo build --release
 ./target/release/wifichecker

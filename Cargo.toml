@@ -1,9 +1,9 @@
 [package]
 name = "wifichecker"
-version = "0.2.2"
+version = "0.2.2-patrlind-1"
 edition = "2024"
 license = "MIT"
-authors = ["Dr. Daniel Dumke"]
+authors = ["Dr. Daniel Dumke", "Patrik Lindahl"]
 
 [dependencies]
 gtk4 = { version = "0.9", features = ["v4_12"] }
