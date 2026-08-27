@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::Measurement;
+use super::signal_source::{SignalSource, signal_for};
 
 /// Which measurement value the floor-plan cell colours are based on.
 ///
@@ -55,7 +56,11 @@ impl ColorMetric {
 }
 
 /// The value of a measurement for a given metric, if that metric is present.
-pub fn metric_value(m: &Measurement, metric: ColorMetric) -> Option<f64> {
+///
+/// For the signal metric the value is resolved through `signal_source`
+/// (connected AP / best AP of the SSID / a specific BSSID); `None` means the
+/// source has no data at this point (cell left uncolored).
+pub fn metric_value(m: &Measurement, metric: ColorMetric, signal_source: &SignalSource) -> Option<f64> {
     // A no-signal point has no reading to place on the scale — it is "no
     // data", not the worst signal — so it contributes no value.
     if m.no_signal {
@@ -64,7 +69,7 @@ pub fn metric_value(m: &Measurement, metric: ColorMetric) -> Option<f64> {
     match metric {
         ColorMetric::SmbMbps   => m.smb_mbps,
         ColorMetric::IperfMbps => m.iperf_mbps,
-        ColorMetric::SignalDbm => Some(m.signal_dbm as f64),
+        ColorMetric::SignalDbm => signal_for(m, signal_source),
     }
 }
 
@@ -98,9 +103,27 @@ mod tests {
     fn metric_value_no_signal_is_none() {
         let m = Measurement::no_signal(0.5, 0.5);
         // No-signal points have no value on the scale (they are "no data").
-        assert_eq!(metric_value(&m, ColorMetric::SignalDbm), None);
-        assert_eq!(metric_value(&m, ColorMetric::IperfMbps), None);
-        assert_eq!(metric_value(&m, ColorMetric::SmbMbps), None);
+        assert_eq!(metric_value(&m, ColorMetric::SignalDbm, &SignalSource::ConnectedAp), None);
+        assert_eq!(metric_value(&m, ColorMetric::IperfMbps, &SignalSource::ConnectedAp), None);
+        assert_eq!(metric_value(&m, ColorMetric::SmbMbps, &SignalSource::ConnectedAp), None);
+    }
+
+    #[test]
+    fn metric_value_signal_resolves_through_source() {
+        let mut m = Measurement::new(0.5, 0.5, "Home".to_string(), "AA:BB:CC:DD:EE:01".to_string(), 5180, 36, -55);
+        m.scan_results = vec![
+            super::super::ScanEntry { ssid: "Home".into(), bssid: "AA:BB:CC:DD:EE:01".into(), frequency_mhz: 5180, channel: 36, signal_dbm: -55, is_active: true },
+            super::super::ScanEntry { ssid: "Home".into(), bssid: "AA:BB:CC:DD:EE:02".into(), frequency_mhz: 2437, channel: 6, signal_dbm: -72, is_active: false },
+        ];
+        // Connected AP source → the associated AP's dBm.
+        assert_eq!(metric_value(&m, ColorMetric::SignalDbm, &SignalSource::ConnectedAp), Some(-55.0));
+        // A specific BSSID source → that AP's dBm.
+        assert_eq!(metric_value(&m, ColorMetric::SignalDbm, &SignalSource::Bssid("AA:BB:CC:DD:EE:02".to_string())), Some(-72.0));
+        // A BSSID not in range → no data.
+        assert_eq!(metric_value(&m, ColorMetric::SignalDbm, &SignalSource::Bssid("AA:BB:CC:DD:EE:99".to_string())), None);
+        // Throughput metrics ignore the source.
+        m.iperf_mbps = Some(120.0);
+        assert_eq!(metric_value(&m, ColorMetric::IperfMbps, &SignalSource::Bssid("AA:BB:CC:DD:EE:99".to_string())), Some(120.0));
     }
 
     #[test]

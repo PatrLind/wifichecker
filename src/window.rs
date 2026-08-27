@@ -11,17 +11,25 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use crate::models::{AppSettings, Floor, Measurement, Project};
+use crate::models::{AppSettings, Floor, Measurement, Project, ScanEntry, SignalSource};
 use crate::persistence::{JsonStore, SettingsStore};
 use crate::persistence::json_store::{drawings_dir_for, ensure_config_dirs};
 use crate::services::{IperfClient, SmbTester, WifiInfo, WifiScanner};
 use crate::widgets::{FloorPlanView, LegendBar, MeasurementPanel, SettingsDialog};
 use crate::widgets::floor_plan_view::DrawMode;
+use std::collections::HashMap;
+
+/// Max APs stored in a measurement's scan list (keeps project files lean;
+/// only the strongest ones matter for coverage analysis).
+const MAX_SCAN_RESULTS: usize = 40;
 
 struct MeasureResult {
     rx: f64,
     ry: f64,
     wifi: Option<WifiInfo>,
+    /// Full scan list for the measured card (strongest first), taken when
+    /// the measurement was recorded.
+    scan_list: Vec<WifiInfo>,
     iperf_mbps: Option<f64>,
     iperf_error: Option<String>,
     smb_mbps: Option<f64>,
@@ -111,6 +119,217 @@ fn auto_save(fp: &FloorPlanView, state: &Rc<RefCell<AppState>>) {
     let _ = JsonStore::save(&project, &project_path);
 }
 
+/// "Known APs" dialog: lists every BSSID seen in this project's measurements
+/// and lets the user assign a friendly alias to each (stored per project).
+/// Aliases are used in the signal-source dropdown and in measurement details.
+fn show_known_aps_dialog(
+    parent: &libadwaita::ApplicationWindow,
+    state: &Rc<RefCell<AppState>>,
+    fp: &FloorPlanView,
+    panel: &MeasurementPanel,
+    overlay: &ToastOverlay,
+    rebuild_source_dd: &Rc<dyn Fn()>,
+) {
+    use gtk4::prelude::*;
+
+    let dialog = gtk4::Window::builder()
+        .title("Known Access Points")
+        .transient_for(parent)
+        .modal(true)
+        .default_width(580)
+        .default_height(440)
+        .build();
+
+    let vbox = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
+    vbox.set_margin_top(12);
+    vbox.set_margin_bottom(12);
+    vbox.set_margin_start(12);
+    vbox.set_margin_end(12);
+
+    let (sections, rest, aliases) = {
+        let s = state.borrow();
+        (
+            s.project.measured_ap_sections(),
+            s.project.unmeasured_bssids(),
+            s.project.bssid_aliases.clone(),
+        )
+    };
+    let total: usize = sections.iter().map(|(_, b)| b.len()).sum::<usize>() + rest.len();
+
+    let desc = gtk4::Label::new(Some(
+        "Access points seen in this project's measurements, grouped by the SSIDs you have measurements for — other networks are listed below. Type an alias to give an AP a friendly name — it is used in the signal-source dropdown and in measurement details. Leave the field empty to clear the alias.",
+    ));
+    desc.set_xalign(0.0);
+    desc.set_wrap(true);
+    vbox.append(&desc);
+
+    if total == 0 {
+        let empty = gtk4::Label::new(Some("No access points recorded yet — take a measurement first."));
+        empty.set_xalign(0.0);
+        vbox.append(&empty);
+    }
+
+    let list = gtk4::ListBox::new();
+    list.add_css_class("boxed-list");
+    // (bssid, entry) pairs so pending edits can be flushed when the dialog
+    // closes (editing-done may not fire if the dialog is closed first).
+    let rows: Rc<RefCell<Vec<(String, gtk4::Entry)>>> = Rc::new(RefCell::new(Vec::new()));
+    for (ssid, bssids) in &sections {
+        if bssids.is_empty() {
+            continue;
+        }
+        add_section_header_row(&list, ssid);
+        for b in bssids {
+            add_known_ap_row(
+                &list, &rows, state, fp, panel, overlay, rebuild_source_dd,
+                b, aliases.get(b).map(|s| s.as_str()),
+            );
+        }
+    }
+    if !rest.is_empty() {
+        add_section_header_row(&list, &format!("Other networks ({} APs)", rest.len()));
+        for b in &rest {
+            add_known_ap_row(
+                &list, &rows, state, fp, panel, overlay, rebuild_source_dd,
+                b, aliases.get(b).map(|s| s.as_str()),
+            );
+        }
+    }
+
+    // Flush any not-yet-confirmed edits and persist when the dialog closes.
+    {
+        let state = state.clone();
+        let fp = fp.clone();
+        let panel = panel.clone();
+        let overlay = overlay.clone();
+        let rebuild = rebuild_source_dd.clone();
+        let rows = rows.clone();
+        dialog.connect_close_request(move |_| {
+            let mut changed = false;
+            {
+                let mut s = state.borrow_mut();
+                for (bssid, entry) in rows.borrow().iter() {
+                    let text = entry.text().trim().to_string();
+                    // Normalize the same way set_alias does (trim, empty = clear)
+                    // so change detection matches the stored value.
+                    let new = if text.is_empty() { None } else { Some(text) };
+                    let old = s.project.bssid_aliases.get(bssid).cloned();
+                    if old != new {
+                        s.project.set_alias(bssid, new);
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                auto_save(&fp, &state);
+                // Re-render all views (Current Signal, selected details, dropdown).
+                panel.set_aliases(state.borrow().project.bssid_aliases.clone());
+                rebuild();
+                overlay.add_toast(Toast::new("Aliases saved"));
+            }
+            glib::Propagation::Proceed
+        });
+    }
+
+    let scroll = gtk4::ScrolledWindow::new();
+    scroll.set_vexpand(true);
+    scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+    scroll.set_child(Some(&list));
+    vbox.append(&scroll);
+
+    dialog.set_child(Some(&vbox));
+    dialog.present();
+}
+
+/// A non-selectable section header row in the Known APs list.
+fn add_section_header_row(list: &gtk4::ListBox, title: &str) {
+    let row = gtk4::ListBoxRow::new();
+    row.set_selectable(false);
+    let label = gtk4::Label::new(Some(title));
+    label.set_xalign(0.0);
+    label.add_css_class("heading");
+    label.set_margin_start(6);
+    label.set_margin_end(6);
+    label.set_margin_top(10);
+    label.set_margin_bottom(2);
+    row.set_child(Some(&label));
+    list.append(&row);
+}
+
+/// One AP row (BSSID + last-seen hint + alias entry) in the Known APs list.
+fn add_known_ap_row(
+    list: &gtk4::ListBox,
+    rows: &Rc<RefCell<Vec<(String, gtk4::Entry)>>> ,
+    state: &Rc<RefCell<AppState>>,
+    fp: &FloorPlanView,
+    panel: &MeasurementPanel,
+    overlay: &ToastOverlay,
+    rebuild_source_dd: &Rc<dyn Fn()>,
+    bssid: &str,
+    alias: Option<&str>,
+) {
+    use gtk4::prelude::*;
+
+    let row = gtk4::ListBoxRow::new();
+    let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    hbox.set_margin_start(6);
+    hbox.set_margin_end(6);
+    hbox.set_margin_top(4);
+    hbox.set_margin_bottom(4);
+
+    let vleft = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    vleft.set_hexpand(true);
+    let b_label = gtk4::Label::new(Some(bssid));
+    b_label.set_xalign(0.0);
+    b_label.add_css_class("monospace");
+    b_label.add_css_class("caption");
+    vleft.append(&b_label);
+    if let Some(ssid) = state.borrow().project.last_ssid_for(bssid) {
+        let s_label = gtk4::Label::new(Some(&format!("last seen: {ssid}")));
+        s_label.set_xalign(0.0);
+        s_label.add_css_class("dim-label");
+        s_label.add_css_class("caption");
+        vleft.append(&s_label);
+    }
+
+    let entry = gtk4::Entry::new();
+    entry.set_placeholder_text(Some("alias…"));
+    entry.set_width_chars(18);
+    if let Some(a) = alias {
+        entry.set_text(a);
+    }
+    {
+        let state = state.clone();
+        let fp = fp.clone();
+        let panel = panel.clone();
+        let overlay = overlay.clone();
+        let rebuild = rebuild_source_dd.clone();
+        let bssid = bssid.to_string();
+        let entry_cb = entry.clone();
+        entry.connect_editing_done(move |_| {
+            let text = entry_cb.text().trim().to_string();
+            {
+                let mut s = state.borrow_mut();
+                s.project.set_alias(&bssid, Some(text.clone()));
+            }
+            panel.set_aliases(state.borrow().project.bssid_aliases.clone());
+            auto_save(&fp, &state);
+            rebuild();
+            overlay.add_toast(Toast::new(if text.is_empty() {
+                "Alias cleared"
+            } else {
+                "Alias updated"
+            }));
+        });
+    }
+
+    hbox.append(&vleft);
+    hbox.append(&entry);
+    row.set_child(Some(&hbox));
+    list.append(&row);
+    rows.borrow_mut().push((bssid.to_string(), entry.clone()));
+}
+
 /// Look up a measurement by id in the current floor (used to feed the
 /// legend's selection pointer with the selected sample).
 fn find_measurement(state: &Rc<RefCell<AppState>>, id: &str) -> Option<Measurement> {
@@ -149,6 +368,11 @@ fn format_new_network_warning(ssid: &str, known: &[String]) -> String {
         format!("{} networks", known.len())
     };
     format!("⚠ New network: \"{ssid}\" (this floor has: {known_str})")
+}
+
+/// Display name for a BSSID: the project alias when set, else the BSSID.
+fn bssid_display_label(aliases: &HashMap<String, String>, bssid: &str) -> String {
+    aliases.get(bssid).cloned().unwrap_or_else(|| bssid.to_string())
 }
 
 /// Index of the WiFi card to measure: the preferred card if it is currently
@@ -326,6 +550,7 @@ fn apply_project(
     floor_dropdown: &DropDown,
     suppress: &Rc<std::cell::Cell<bool>>,
     settings: &Rc<RefCell<AppSettings>>,
+    rebuild_source_dd: &Rc<dyn Fn()>,
     project: Project,
     project_path: PathBuf,
 ) -> String {
@@ -357,6 +582,10 @@ fn apply_project(
     suppress.set(false);
 
     load_floor_into_view(fp, legend, panel, &start_floor);
+    // New project in effect — refresh panel aliases and the signal-source
+    // dropdown (its selected BSSID may not exist in this project).
+    panel.set_aliases(state.borrow().project.bssid_aliases.clone());
+    rebuild_source_dd();
     state.borrow().project.name.clone()
 }
 
@@ -397,6 +626,24 @@ fn build_ui(
     edit_floor_btn.set_tooltip_text(Some("Rename or delete current floor"));
     header.pack_start(&edit_floor_btn);
 
+    // Signal source filter: which AP's signal the map/list show (connected
+    // AP, best AP of the SSID, or a specific BSSID from this project).
+    let source_model = StringList::new(&[
+        SignalSource::CONNECTED_AP_LABEL,
+        SignalSource::SSID_LABEL,
+    ]);
+    let source_dd = DropDown::new(Some(source_model.clone()), gtk4::Expression::NONE);
+    source_dd.set_tooltip_text(Some(
+        "Signal source: which AP's signal strength the map shows (connected AP, best AP of the SSID, or a specific BSSID)",
+    ));
+    header.pack_start(&source_dd);
+
+    let known_aps_btn = Button::from_icon_name("network-wireless-symbolic");
+    known_aps_btn.set_tooltip_text(Some(
+        "Known APs: access points seen in this project — set alias names",
+    ));
+    header.pack_start(&known_aps_btn);
+
     let heatmap_toggle = ToggleButton::new();
     heatmap_toggle.set_icon_name("view-grid-symbolic");
     heatmap_toggle.set_tooltip_text(Some("Toggle heatmap"));
@@ -408,6 +655,72 @@ fn build_ui(
     header.pack_end(&settings_btn);
 
     main_box.append(&header);
+
+    // ── Signal source: rebuild the dropdown options ────────────────────────
+    // Options: "Connected AP", then one entry per SSID that has saved
+    // measurements ("best AP of this network"), each followed by its BSSIDs
+    // (indented). Networks that only appear in scan lists are not options.
+    // Rebuilding preserves the current selection; if the selected AP no
+    // longer exists (e.g. measurements deleted) it falls back to
+    // "Connected AP".
+    let suppress_source_change = Rc::new(std::cell::Cell::new(false));
+    // The options currently shown, parallel to the dropdown rows; used by
+    // selected_notify to resolve the chosen source.
+    let source_options: Rc<RefCell<Vec<SignalSource>>> = Rc::new(RefCell::new(Vec::new()));
+    let rebuild_source_dd: Rc<dyn Fn()> = Rc::new({
+        let state = state.clone();
+        let settings = settings.clone();
+        let source_model = source_model.clone();
+        let source_dd = source_dd.clone();
+        let suppress = suppress_source_change.clone();
+        let source_options = source_options.clone();
+        move || {
+            let (opts, labels, current) = {
+                let s = state.borrow();
+                let ssids = s.project.measured_ssids();
+                let mut opts: Vec<SignalSource> = vec![SignalSource::ConnectedAp];
+                let mut labels: Vec<String> = vec![SignalSource::CONNECTED_AP_LABEL.to_string()];
+                for ssid in &ssids {
+                    opts.push(SignalSource::Ssid(ssid.clone()));
+                    labels.push(ssid.clone());
+                    for b in s.project.bssids_of_ssid(ssid) {
+                        opts.push(SignalSource::Bssid(b.clone()));
+                        labels.push(format!("  {}", bssid_display_label(&s.project.bssid_aliases, &b)));
+                    }
+                }
+                (opts, labels, settings.borrow().signal_source.clone())
+            };
+            // Resolve the current source to a row.
+            let (target_idx, fallback) = match &current {
+                SignalSource::ConnectedAp => (0u32, false),
+                SignalSource::Ssid(s) if !s.is_empty() => match opts.iter().position(|x| *x == current) {
+                    Some(p) => (p as u32, false),
+                    None => (0, true), // SSID no longer measured → fall back
+                },
+                SignalSource::Ssid(_) => match opts
+                    .iter()
+                    .position(|x| matches!(x, SignalSource::Ssid(x) if !x.is_empty()))
+                {
+                    Some(p) => (p as u32, false), // legacy generic → first measured SSID
+                    None => (0, false),
+                },
+                SignalSource::Bssid(_) => match opts.iter().position(|x| *x == current) {
+                    Some(p) => (p as u32, false),
+                    None => (0, true), // chosen BSSID is gone → fall back
+                },
+            };
+            *source_options.borrow_mut() = opts;
+            suppress.set(true);
+            let refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+            source_model.splice(0, source_model.n_items(), &refs);
+            source_dd.set_selected(target_idx);
+            suppress.set(false);
+            if fallback {
+                settings.borrow_mut().signal_source = SignalSource::ConnectedAp;
+                let _ = SettingsStore::save(&settings.borrow());
+            }
+        }
+    });
 
     // ── Drawing toolbar ───────────────────────────────────────────────────────
     let draw_bar = GtkBox::new(Orientation::Horizontal, 4);
@@ -700,6 +1013,7 @@ fn build_ui(
             let legend = legend.clone();
             let window = window.clone();
             let measuring = measuring.clone();
+            let rebuild_source_dd = rebuild_source_dd.clone();
             move |rx: f64, ry: f64| {
             // Block new measurements while one is in progress.
             if *measuring.borrow() {
@@ -738,6 +1052,14 @@ fn build_ui(
                 let cards = WifiScanner::scan_all().unwrap_or_default();
                 let wifi = pick_card_index(&preferred_device, &cards).and_then(|i| cards.get(i).cloned());
 
+                // Fresh scan list for the measured card (all APs in range,
+                // strongest first). Requests a new scan and waits up to ~6 s
+                // for it; falls back to the cached list on failure.
+                let scan_list = wifi
+                    .as_ref()
+                    .map(|w| WifiScanner::scan_list(Some(&w.device)).unwrap_or_default())
+                    .unwrap_or_default();
+
                 let (iperf_mbps, iperf_error) = if iperf_enabled && !iperf_server.is_empty() {
                     match IperfClient::new(&iperf_server, iperf_port, iperf_dur, iperf_streams).run_test() {
                         Ok(mbps) => (Some(mbps), None),
@@ -759,7 +1081,7 @@ fn build_ui(
                     (None, None)
                 };
 
-                tx.send_blocking(MeasureResult { rx, ry, wifi, iperf_mbps, iperf_error, smb_mbps, smb_error }).ok();
+                tx.send_blocking(MeasureResult { rx, ry, wifi, scan_list, iperf_mbps, iperf_error, smb_mbps, smb_error }).ok();
             });
 
             let state2 = state.clone();
@@ -769,6 +1091,7 @@ fn build_ui(
             let legend2 = legend.clone();
             let measuring2 = measuring.clone();
             let window2 = window.clone();
+            let rebuild_source_dd2 = rebuild_source_dd.clone();
 
             glib::spawn_future_local(async move {
                 let Ok(result) = recv.recv().await else {
@@ -810,6 +1133,20 @@ fn build_ui(
                     info.ssid.clone(), info.bssid.clone(),
                     info.frequency_mhz, info.channel, info.signal_dbm,
                 );
+                // Store the scan list taken at this point (strongest first).
+                m.scan_results = result
+                    .scan_list
+                    .iter()
+                    .take(MAX_SCAN_RESULTS)
+                    .map(|w| ScanEntry {
+                        ssid: w.ssid.clone(),
+                        bssid: w.bssid.clone(),
+                        frequency_mhz: w.frequency_mhz,
+                        channel: w.channel,
+                        signal_dbm: w.signal_dbm,
+                        is_active: w.is_active,
+                    })
+                    .collect();
                 m.iperf_mbps = result.iperf_mbps;
                 m.smb_mbps = result.smb_mbps;
                 let new_id = m.id.clone();
@@ -840,11 +1177,15 @@ fn build_ui(
                 legend2.set_measurements(&measurements);
                 panel3.set_measurements(panel_measurements);
                 panel3.set_throughput_unit(unit);
+                // New measurements may have introduced new BSSIDs — refresh
+                // the signal-source dropdown options (selection is preserved).
+                rebuild_source_dd2();
                 panel3.update_current_wifi(
                     &info.ssid, &info.bssid,
                     info.signal_dbm, info.frequency_mhz, info.channel,
                     &info.device,
                     result.iperf_mbps, result.smb_mbps, unit,
+                    Some(&result.scan_list),
                 );
                 legend2.set_current_signal(Some(info.signal_dbm as f64));
                 // Show the just-recorded sample in Selected Measurement + highlight it.
@@ -1029,6 +1370,11 @@ fn build_ui(
         let off_flag: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
         // Tracks whether the "preferred card unavailable" warning is shown.
         let pref_flag: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+        // Shared cached AP list: (device, LastScan counter, list). The full
+        // AP property read only happens when NM's LastScan advances (a scan
+        // completed), so the per-tick cost is a single property read.
+        let scan_cache: std::sync::Arc<std::sync::Mutex<(String, i64, Vec<WifiInfo>)>> =
+            std::sync::Arc::new(std::sync::Mutex::new((String::new(), 0, Vec::new())));
         let _ = glib::timeout_add_local(std::time::Duration::from_millis(1500), move || {
             let p = panel.clone();
             let lg = legend.clone();
@@ -1037,22 +1383,72 @@ fn build_ui(
             let off = off_flag.clone();
             let pref = pref_flag.clone();
             let preferred = settings.borrow().wifi_device.clone();
+            let source = settings.borrow().signal_source.clone();
             let (tx, rx) = async_channel::bounded(1);
             {
                 let pt = preferred.clone();
+                let scan_cache = scan_cache.clone();
                 std::thread::spawn(move || {
                     let cards = WifiScanner::scan_all().unwrap_or_default();
                     let chosen = pick_card_index(&pt, &cards);
                     let info = chosen.and_then(|i| cards.get(i).cloned());
-                    let _ = tx.send_blocking((cards, info));
+                    // AP list for the measured card: re-read the cached scan
+                    // list only when NM completed a new scan since the last
+                    // tick (LastScan counter advanced), or when the card changed.
+                    let list = match info.as_ref() {
+                        Some(w) => {
+                            let dev = w.device.clone();
+                            let (cdev, prev_ls) = {
+                                let c = scan_cache.lock().unwrap();
+                                (c.0.clone(), c.1)
+                            };
+                            if dev != cdev {
+                                // Card switched — force a fresh read.
+                                match WifiScanner::scan_list_if_newer(Some(&dev), 0) {
+                                    Ok(Some((ls, new_list))) => {
+                                        *scan_cache.lock().unwrap() = (dev, ls, new_list.clone());
+                                        new_list
+                                    }
+                                    _ => Vec::new(),
+                                }
+                            } else {
+                                match WifiScanner::scan_list_if_newer(Some(&dev), prev_ls) {
+                                    Ok(Some((ls, new_list))) => {
+                                        *scan_cache.lock().unwrap() = (dev, ls, new_list.clone());
+                                        new_list
+                                    }
+                                    _ => scan_cache.lock().unwrap().2.clone(),
+                                }
+                            }
+                        }
+                        None => Vec::new(),
+                    };
+                    let _ = tx.send_blocking((cards, info, list));
                 });
             }
             glib::spawn_future_local(async move {
-                let Ok((cards, info)) = rx.recv().await else { return };
+                let Ok((cards, info, list)) = rx.recv().await else { return };
                 match info {
                     Some(w) => {
-                        p.refresh_live_signal(&w.ssid, &w.bssid, w.signal_dbm, w.frequency_mhz, w.channel, &w.device);
-                        lg.set_current_signal(Some(w.signal_dbm as f64));
+                        p.refresh_live_signal(&w.ssid, &w.bssid, w.signal_dbm, w.frequency_mhz, w.channel, &w.device, Some(&list));
+                        // Legend pointer value follows the active signal source.
+                        let legend_dbm = match &source {
+                            SignalSource::ConnectedAp => Some(w.signal_dbm as f64),
+                            SignalSource::Ssid(ssid) => {
+                                let target = if ssid.is_empty() { w.ssid.as_str() } else { ssid.as_str() };
+                                list.iter()
+                                    .filter(|e| e.ssid == target)
+                                    .map(|e| e.signal_dbm)
+                                    .max()
+                                    .map(|v| v as f64)
+                                    .or(if ssid.is_empty() { Some(w.signal_dbm as f64) } else { None })
+                            }
+                            SignalSource::Bssid(b) => list
+                                .iter()
+                                .find(|e| &e.bssid == b)
+                                .map(|e| e.signal_dbm as f64),
+                        };
+                        lg.set_current_signal(legend_dbm);
                         // Show the card selector when more than one card is active.
                         let opts: Vec<String> = cards.iter().map(|c| c.device.clone()).collect();
                         p.set_card_selector(&opts, Some(w.device.as_str()));
@@ -1105,6 +1501,7 @@ fn build_ui(
         let panel = panel.clone();
         let panel2 = panel.clone();
         let legend = legend.clone();
+        let rebuild = rebuild_source_dd.clone();
         panel.set_on_delete(move |id| {
             let was_selected = fp.get_selected_measurement().as_deref() == Some(id.as_str());
             let measurements = {
@@ -1127,6 +1524,7 @@ fn build_ui(
                 panel2.set_selected_by_id(None);
             }
             auto_save(&fp, &state);
+            rebuild();
         });
     }
 
@@ -1139,6 +1537,7 @@ fn build_ui(
         let window_ref = window.clone();
         let panel_ref = panel.clone();
         let legend = legend.clone();
+        let rebuild = rebuild_source_dd.clone();
         panel_ref.set_on_delete_all(move || {
             let n_floors = state.borrow().project.floors.len();
             let dialog = MessageDialog::builder()
@@ -1166,6 +1565,9 @@ fn build_ui(
             let panel2 = panel.clone();
             let overlay2 = overlay_ref.clone();
             let legend2 = legend.clone();
+            // `rebuild` is captured by the outer Fn closure — clone it before
+            // the one-shot continuation closure is created.
+            let rebuild2 = rebuild.clone();
             dialog.choose(gtk4::gio::Cancellable::NONE, move |response| {
                 match response.as_str() {
                     "current" => {
@@ -1184,6 +1586,7 @@ fn build_ui(
                         legend2.set_selected_measurement(None);
                         panel2.set_network_warning(None);
                         auto_save(&fp2, &state2);
+                        rebuild2();
                         overlay2.add_toast(Toast::new("Measurements deleted"));
                     }
                     "all" => {
@@ -1201,6 +1604,7 @@ fn build_ui(
                         legend2.set_selected_measurement(None);
                         panel2.set_network_warning(None);
                         auto_save(&fp2, &state2);
+                        rebuild2();
                         overlay2.add_toast(Toast::new("All measurements deleted"));
                     }
                     _ => {}
@@ -1482,6 +1886,42 @@ fn build_ui(
         });
     }
 
+    // Signal source dropdown (user selection)
+    {
+        let settings = settings.clone();
+        let fp = floor_plan.clone();
+        let legend = legend.clone();
+        let panel = panel.clone();
+        let suppress = suppress_source_change.clone();
+        source_dd.connect_selected_notify(move |dd| {
+            if suppress.get() { return; }
+            let idx = dd.selected() as usize;
+            let src: SignalSource = source_options
+                .borrow()
+                .get(idx)
+                .cloned()
+                .unwrap_or(SignalSource::ConnectedAp);
+            settings.borrow_mut().signal_source = src.clone();
+            let _ = SettingsStore::save(&settings.borrow());
+            fp.set_signal_source(src.clone());
+            legend.set_signal_source(src.clone());
+            panel.set_signal_source(src.clone());
+        });
+    }
+
+    // Known APs dialog (manage BSSID aliases)
+    {
+        let window_ref = window.clone();
+        let state = state.clone();
+        let fp = floor_plan.clone();
+        let panel = panel.clone();
+        let overlay_ref = overlay.clone();
+        let rebuild = rebuild_source_dd.clone();
+        known_aps_btn.connect_clicked(move |_| {
+            show_known_aps_dialog(&window_ref, &state, &fp, &panel, &overlay_ref, &rebuild);
+        });
+    }
+
     // ── Project menu actions ────────────────────────────────────────────────
     {
         let win_actions = gtk4::gio::SimpleActionGroup::new();
@@ -1500,6 +1940,7 @@ fn build_ui(
             let settings = settings.clone();
             let overlay_ref = overlay.clone();
             let window_ref2 = window_ref.clone();
+            let rebuild_source_dd = rebuild_source_dd.clone();
             act_new.connect_activate(move |_, _| {
                 let dialog = MessageDialog::builder()
                     .heading("Start New Project")
@@ -1523,6 +1964,7 @@ fn build_ui(
                 let settings2 = settings.clone();
                 let overlay2 = overlay_ref.clone();
                 let window_ref3 = window_ref2.clone();
+                let rebuild2 = rebuild_source_dd.clone();
                 dialog.choose(gtk4::gio::Cancellable::NONE, move |response| {
                     if response.as_str() != "new" { return; }
                     // The current project stays saved at its current path
@@ -1530,7 +1972,7 @@ fn build_ui(
                     let mut project = Project::new("New Project");
                     project.add_floor(Floor::new("Floor 1"));
                     let name = apply_project(
-                        &state2, &fp2, &legend2, &panel2, &fm2, &dd2, &suppress2, &settings2,
+                        &state2, &fp2, &legend2, &panel2, &fm2, &dd2, &suppress2, &settings2, &rebuild2,
                         project, JsonStore::default_path(),
                     );
                     window_ref3.set_title(Some(&format!("{name} — WiFi Checker")));
@@ -1553,6 +1995,7 @@ fn build_ui(
             let settings = settings.clone();
             let overlay_ref = overlay.clone();
             let window_ref2 = window_ref.clone();
+            let rebuild_source_dd = rebuild_source_dd.clone();
             act_open.connect_activate(move |_, _| {
                 let dialog = FileDialog::builder().title("Open Project").modal(true).build();
                 let filter = gtk4::FileFilter::new();
@@ -1573,6 +2016,7 @@ fn build_ui(
                 let overlay2 = overlay_ref.clone();
                 let window_ref3 = window_ref2.clone();
                 let dialog_parent = window_ref2.clone();
+                let rebuild2 = rebuild_source_dd.clone();
                 dialog.open(Some(&dialog_parent), gtk4::gio::Cancellable::NONE, move |result| {
                     let Ok(file) = result else { return; };
                     let Some(path) = file.path() else { return; };
@@ -1588,7 +2032,7 @@ fn build_ui(
                     // Persist the project we are about to replace
                     auto_save(&fp2, &state2);
                     let name = apply_project(
-                        &state2, &fp2, &legend2, &panel2, &fm2, &dd2, &suppress2, &settings2,
+                        &state2, &fp2, &legend2, &panel2, &fm2, &dd2, &suppress2, &settings2, &rebuild2,
                         project, path,
                     );
                     window_ref3.set_title(Some(&format!("{name} — WiFi Checker")));
@@ -1681,6 +2125,18 @@ fn build_ui(
         if let Some(floor) = start_floor {
             load_floor_into_view(&floor_plan, &legend, &panel, &floor);
         }
+        // Apply the saved signal source and project aliases to the UI.
+        {
+            let (aliases, src) = {
+                let s = state.borrow();
+                (s.project.bssid_aliases.clone(), settings.borrow().signal_source.clone())
+            };
+            panel.set_aliases(aliases.clone());
+            panel.set_signal_source(src.clone());
+            floor_plan.set_signal_source(src.clone());
+            legend.set_signal_source(src);
+        }
+        rebuild_source_dd();
     }
 
     // Auto-save if we just created the default floor

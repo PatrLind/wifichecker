@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 use crate::models::Measurement;
+use crate::models::SignalSource;
 use crate::models::color_metric::{ColorMetric, metric_value, value_color};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -41,6 +42,9 @@ struct FloorPlanState {
     color_metric: ColorMetric,
     color_min: f64,
     color_max: f64,
+    /// Which AP's signal the signal metric resolves to (connected AP / SSID
+    /// best / a specific BSSID).
+    signal_source: SignalSource,
 
     // Draw mode
     mode: DrawMode,
@@ -130,6 +134,7 @@ impl FloorPlanView {
             color_metric: ColorMetric::SignalDbm,
             color_min: ColorMetric::SignalDbm.reference_range().0,
             color_max: ColorMetric::SignalDbm.reference_range().1,
+            signal_source: SignalSource::default(),
             mode: DrawMode::Measure,
             canvas: None,
             last_draw_pos: None,
@@ -663,6 +668,16 @@ impl FloorPlanView {
         self.widget.queue_draw();
     }
 
+    /// Set which AP's signal the signal metric resolves to (connected AP /
+    /// best AP of the measured SSID / a specific BSSID). Cells where the
+    /// chosen AP is absent (a BSSID out of range) are left uncolored.
+    pub fn set_signal_source(&self, source: SignalSource) {
+        let mut s = self.state.borrow_mut();
+        s.signal_source = source;
+        drop(s);
+        self.widget.queue_draw();
+    }
+
     pub fn set_show_heatmap(&self, show: bool) {
         self.state.borrow_mut().show_heatmap = show;
         self.widget.queue_draw();
@@ -1022,7 +1037,7 @@ fn draw_all(state: &FloorPlanState, ctx: &Context, w: i32, h: i32) {
     // 5. Measurement cell coloring (replaces heatmap and individual dots)
     if state.show_heatmap && !state.measurements.is_empty() {
         let origin = state.origin.map(|(rx, ry)| (rx * map_w, ry * map_h));
-        draw_measurement_cells(ctx, map_w, map_h, &state.measurements, state.scale_px_per_m, state.measurement_grid_spacing_m, state.color_metric, state.color_min, state.color_max, origin);
+        draw_measurement_cells(ctx, map_w, map_h, &state.measurements, state.scale_px_per_m, state.measurement_grid_spacing_m, state.color_metric, state.color_min, state.color_max, origin, &state.signal_source);
     }
 
     // 5.5 Selected measurement highlight (inspect mode)
@@ -1153,6 +1168,7 @@ fn draw_measurement_cells(
     min: f64,
     max: f64,
     origin: Option<(f64, f64)>,
+    signal_source: &SignalSource,
 ) {
     let px_step = grid_px_step(scale_px_per_m, spacing_m);
     let (ox, oy) = origin.unwrap_or((0.0, 0.0));
@@ -1163,11 +1179,13 @@ fn draw_measurement_cells(
         // The measurement is stored at cell center; find its cell (anchored to the origin).
         let (cell_x, cell_y) = cell_anchor(px, py, px_step, (ox, oy));
         // A no-signal point is "no data" — a neutral gray, not the worst
-        // (red) colour on the scale. Regular samples use the metric colour.
+        // (red) colour on the scale. Regular samples use the metric colour;
+        // a missing value (e.g. the chosen BSSID not in range) is left
+        // uncolored.
         let (r, g, b) = if m.no_signal {
             (0.5, 0.5, 0.5)
         } else {
-            match metric_value(m, metric) {
+            match metric_value(m, metric, signal_source) {
                 Some(v) => value_color(v, min, max),
                 None => continue,
             }

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::ColorMetric;
+use super::signal_source::SignalSource;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum ThroughputUnit {
@@ -60,6 +61,9 @@ pub struct AppSettings {
     pub throughput_unit: ThroughputUnit,
     /// Which measurement value the floor-plan cell colours are based on.
     pub color_metric: ColorMetric,
+    /// Which AP's signal the display is based on: the connected AP, the best
+    /// AP of the measured SSID, or a specific BSSID (see Known APs dialog).
+    pub signal_source: SignalSource,
 
     // WiFi
     /// Preferred WiFi card interface to measure (e.g. "wlan0"). `None` means
@@ -94,6 +98,7 @@ impl Default for AppSettings {
 
             throughput_unit: ThroughputUnit::Mbit,
             color_metric: ColorMetric::default(),
+            signal_source: SignalSource::default(),
 
             wifi_device: None,
 
@@ -157,6 +162,18 @@ mod tests {
         assert!(!s.snap_to_grid);
         assert_eq!(s.throughput_unit, ThroughputUnit::Mbit);
         assert_eq!(s.color_metric, ColorMetric::SignalDbm);
+        assert!(s.signal_source.is_connected_ap());
+    }
+
+    #[test]
+    fn test_signal_source_setting_roundtrip() {
+        let s = AppSettings {
+            signal_source: SignalSource::Bssid("AA:BB:CC:DD:EE:02".to_string()),
+            ..AppSettings::default()
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let s2: AppSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(s2.signal_source, SignalSource::Bssid("AA:BB:CC:DD:EE:02".to_string()));
     }
 
     #[test]

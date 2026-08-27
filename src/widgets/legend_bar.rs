@@ -6,6 +6,7 @@ use std::rc::Rc;
 
 use crate::models::Measurement;
 use crate::models::color_metric::{ColorMetric, metric_value, value_color};
+use crate::models::SignalSource;
 
 #[derive(Clone)]
 pub struct LegendBar {
@@ -24,6 +25,8 @@ struct LegendState {
     /// Live current WiFi signal (dBm). Shown by the pointer when no measurement
     /// is selected and the metric is signal strength.
     current_signal_dbm: Option<f64>,
+    /// Which AP's signal the pointer marks (connected AP / SSID best / BSSID).
+    signal_source: SignalSource,
 }
 
 impl LegendBar {
@@ -41,6 +44,7 @@ impl LegendBar {
             active: false,
             selected: None,
             current_signal_dbm: None,
+            signal_source: SignalSource::default(),
         }));
 
         {
@@ -54,7 +58,7 @@ impl LegendBar {
                 let marker_val = match s.selected.as_ref() {
                     // A no-signal point has no value on the scale -> no marker.
                     Some(m) if m.no_signal => None,
-                    Some(m) => metric_value(m, s.metric),
+                    Some(m) => metric_value(m, s.metric, &s.signal_source),
                     None => {
                         if s.metric == ColorMetric::SignalDbm {
                             s.current_signal_dbm
@@ -105,6 +109,15 @@ impl LegendBar {
         s.metric = metric;
         s.min = min;
         s.max = max;
+        drop(s);
+        self.widget.queue_draw();
+    }
+
+    /// Set which AP's signal the pointer marks (connected AP / SSID best /
+    /// a specific BSSID). Re-reads the selected measurement's value.
+    pub fn set_signal_source(&self, source: SignalSource) {
+        let mut s = self.state.borrow_mut();
+        s.signal_source = source;
         drop(s);
         self.widget.queue_draw();
     }

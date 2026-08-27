@@ -5,17 +5,15 @@ I used Qwen 3.8 27B to implement a few new features and fixed a few bugs so it w
 Since these changes are "vide coded" I suggest you avoid using it. 
 Here is a summary of the changes made:
 
-- **Project save/load** – multiple floors, per-project drawings, auto-save, and a project menu (Open / Save As).
-- **Fixed a crash** in calibrate mode (`RefCell already borrowed`).
-- **Unified map coordinate space** – fixed origin/grid/cell drift on window resize; the origin now persists across restarts.
-- **Select/Inspect tool** – click a measurement on the map or in the list; two‑way correlation between map, list, and a "Selected Measurement" detail view.
-- **Live Current Signal** – the panel refreshes the active WiFi signal ~every 1.5 s; new measurements are auto‑selected.
-- **In‑flight measurement indicator** – a pulsating box marks the cell being measured, and repeated clicks are ignored while a measurement is running.
-- **Absolute, configurable colour scale** – colour cells by Signal strength, iperf, or Samba throughput (a fixed reference range, so a sample's colour is stable); the legend shows tick marks/labels.
-- **Legend pointer** – a marker on the gradient shows where a selected measurement (or the live current signal, when nothing is selected) lands.
-- **Resizable side panel** – drag the divider between the map and the panel.
-- **Network consistency** – a floor tracks the set of SSIDs it has measured; when you're connected to a new SSID you get a warning, and measuring on it asks for confirmation (so a 2 GHz + 5 GHz SSID can be mapped together, while an unrelated network still triggers a warning).
-- **Custom select (cursor) tool icon.**
+- **Project save/load** – multiple floors, per-project drawings, auto-save, project menu (New / Open / Save As).
+- **Tools** – select/inspect (two-way map ↔ list ↔ details), ruler distance measure, draw, calibrate (crash fixed), set origin; visibility toggles; custom cursor icon.
+- **Measurements** – in-flight indicator (pulsating cell, repeated clicks ignored), multi-WiFi-card selection, no-signal (dead zone) points.
+- **Map & colour** – unified coordinate space (no drift on resize, origin persists), absolute colour scale by signal/iperf/Samba with legend ticks and pointer (selected sample or live signal), resizable map/panel split, live Current Signal refresh (~1.5 s).
+- **Network consistency** – warns when connected to an SSID not measured on the floor; measuring it asks for confirmation (2 GHz + 5 GHz SSIDs can be mapped together).
+- **Scan list per measurement** – every point stores all in-range APs (SSID, BSSID, dBm, channel, band) from a fresh NetworkManager scan over D-Bus (no new Flatpak permissions).
+- **Signal source filter** – dropdown picks which AP's signal the map/list/legend show: connected AP, best AP of a measured SSID, or a specific BSSID (only your measured networks); out-of-range BSSIDs render as *no data*.
+- **BSSID aliases** – Known APs dialog (grouped by measured SSID, others below) assigns friendly names, stored per project, reflected live in all views.
+- **AP visibility** – live "This SSID in range" block in Current Signal, per-point "All other networks" popup (column-aligned table), 2.4/5/6 GHz band display, resizable details/list split in the panel.
 
 
 <p align="center">
@@ -46,7 +44,8 @@ Here is a summary of the changes made:
 - **Calibration** — set a real-world scale by clicking two known points and entering the distance in metres
 - **Snap-to-grid** — configurable measurement grid with optional snap for consistent coverage
 - **Zoom & pan** — scroll-wheel zoom (cursor-centred) plus zoom in/out/reset buttons
-- **Project files** — start new projects, open existing ones, or save-as to any location from the project menu
+- **Project files** – start new projects, open existing ones, or save-as to any location from the project menu
+- **Scan list & signal source** – every point stores all APs in range; pick which AP's signal the map shows (connected AP / best AP of a measured SSID / a specific BSSID), browse the full "other networks" list per point, and give APs friendly alias names
 - **Auto-save** — project, drawings, and settings persist automatically to `~/.config/wifichecker/`
 
 ---
@@ -124,6 +123,23 @@ Open **Settings** (the network icon in the header) and enable:
 - **Samba speed test** — enter your SMB server, share name, and credentials
 
 Both tests run in the background alongside every WiFi scan and their results are stored with each measurement.
+
+### Signal source filter & BSSID aliases
+
+A typical network has several APs, but the computer is only connected to one of them. To map the *network's* signal (or one specific AP's signal) instead:
+
+1. The **signal source dropdown** in the header selects which AP's signal the map, list, and legend show:
+   - **Connected AP** — the AP the computer is associated with (default, classic behavior)
+   - **<SSID>** — one entry per SSID you have measurements for; selects the *strongest* AP broadcasting that SSID (what you usually want for a multi-AP network)
+   - **<BSSID>** — an indented entry under each SSID, for one specific BSSID; cells where that AP was not in range stay uncoloured ("no data"), showing exactly where it does not reach
+
+   The dropdown is built from your saved measurements, so it only offers the SSIDs you have actually mapped and the BSSIDs of those SSIDs — not every passing network on the airwaves.
+2. Every measurement stores the full scan list taken at that point (up to the 40 strongest APs). Select a point with the **Select** tool to see it in the *Selected Measurement* panel: the measured SSID's APs are shown inline (the associated AP marked with ●), and an **"All other networks (N APs)"** button opens a popup with the complete list of the other APs in range at that point (useful for channel planning).
+3. The **Current Signal** section also shows a live **"This SSID in range (N APs)"** block: every BSSID broadcasting your currently connected SSID and its signal, so you can see your own multi-AP network while walking.
+4. The band is shown as **2.4 / 5 / 6 GHz** throughout (derived from the center frequency).
+5. The **Known APs** button (network icon next to the dropdown) lists every AP seen in the project. Type an alias (e.g. "Office-AP-1") next to a BSSID to give it a friendly name — used in the dropdown and in details. Aliases are saved with the project (including when you close the dialog).
+
+Note: each measurement triggers a fresh scan (up to ~6 s) before recording, so the scan list is current; speed tests still run afterwards, so expect a few extra seconds per point.
 
 ---
 

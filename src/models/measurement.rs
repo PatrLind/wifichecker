@@ -1,6 +1,29 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// One access point seen in the scan list at a measurement point.
+///
+/// A measurement stores the full scan list taken at that moment, so the
+/// signal of *any* in-range AP (not just the one the computer is connected
+/// to) can be visualized later.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScanEntry {
+    pub ssid: String,
+    pub bssid: String,
+    pub frequency_mhz: u32,
+    pub channel: u8,
+    pub signal_dbm: i32,
+    /// True for the AP the computer is currently associated with.
+    #[serde(default)]
+    pub is_active: bool,
+}
+
+impl ScanEntry {
+    pub fn band(&self) -> &'static str {
+        super::band_label(self.frequency_mhz)
+    }
+}
+
 /// A single WiFi measurement at a position on the floor plan.
 /// x and y are relative coordinates in [0.0, 1.0].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,6 +47,10 @@ pub struct Measurement {
     /// connected) — used to mark dead zones on the coverage map.
     #[serde(default)]
     pub no_signal: bool,
+    /// All access points in range when this measurement was taken
+    /// (strongest first). Old projects have an empty list here.
+    #[serde(default)]
+    pub scan_results: Vec<ScanEntry>,
 }
 
 impl Measurement {
@@ -43,6 +70,7 @@ impl Measurement {
             iperf_mbps: None,
             smb_mbps: None,
             no_signal: false,
+            scan_results: Vec::new(),
         }
     }
 
@@ -64,6 +92,7 @@ impl Measurement {
             iperf_mbps: None,
             smb_mbps: None,
             no_signal: true,
+            scan_results: Vec::new(),
         }
     }
 
@@ -170,6 +199,38 @@ mod tests {
     fn test_regular_measurement_is_not_no_signal() {
         let m = make_measurement(-60);
         assert!(!m.no_signal);
+    }
+
+    #[test]
+    fn test_scan_entry_band() {
+        let e24 = ScanEntry { ssid: "A".into(), bssid: "B".into(), frequency_mhz: 2437, channel: 6, signal_dbm: -60, is_active: false };
+        let e5 = ScanEntry { ssid: "A".into(), bssid: "B".into(), frequency_mhz: 5180, channel: 36, signal_dbm: -60, is_active: true };
+        let e6 = ScanEntry { ssid: "A".into(), bssid: "B".into(), frequency_mhz: 5955, channel: 5, signal_dbm: -60, is_active: false };
+        assert_eq!(e24.band(), "2.4 GHz");
+        assert_eq!(e5.band(), "5 GHz");
+        assert_eq!(e6.band(), "6 GHz");
+    }
+
+    #[test]
+    fn test_measurement_json_with_scan_results_roundtrip() {
+        let mut m = make_measurement(-60);
+        m.scan_results = vec![
+            ScanEntry { ssid: "MyHome".into(), bssid: "AA:BB:CC:DD:EE:01".into(), frequency_mhz: 5180, channel: 36, signal_dbm: -55, is_active: true },
+            ScanEntry { ssid: "MyHome".into(), bssid: "AA:BB:CC:DD:EE:02".into(), frequency_mhz: 2437, channel: 6, signal_dbm: -70, is_active: false },
+        ];
+        let json = serde_json::to_string(&m).unwrap();
+        let m2: Measurement = serde_json::from_str(&json).unwrap();
+        assert_eq!(m2.scan_results.len(), 2);
+        assert!(m2.scan_results[0].is_active);
+        assert_eq!(m2.scan_results[1].bssid, "AA:BB:CC:DD:EE:02");
+    }
+
+    #[test]
+    fn test_measurement_json_without_scan_results_uses_default() {
+        // Old saved projects have no `scan_results` field; it should default to empty.
+        let json = r#"{"id":"x","x":0.5,"y":0.5,"timestamp":"2024-01-01T00:00:00Z","ssid":"A","bssid":"B","frequency_mhz":2412,"channel":1,"signal_dbm":-70,"noise_dbm":null,"link_speed_mbps":null,"iperf_mbps":null,"smb_mbps":null}"#;
+        let m: Measurement = serde_json::from_str(json).unwrap();
+        assert!(m.scan_results.is_empty());
     }
 
     #[test]
