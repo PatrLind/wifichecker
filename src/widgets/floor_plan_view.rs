@@ -86,6 +86,9 @@ struct FloorPlanState {
     zoom: f64,
     pan_x: f64,
     pan_y: f64,
+    /// When true, the next draw fits the map into the widget. Set on image
+    /// load / floor switch; cleared once applied.
+    needs_fit: bool,
     /// Stored pan at the start of a middle-button pan drag.
     pan_origin: Option<(f64, f64)>,
     /// Last known mouse position in widget space (used for scroll-wheel zoom centre).
@@ -103,6 +106,7 @@ struct FloorPlanState {
     on_measure_click: Option<Box<dyn Fn(f64, f64)>>,
     on_calibration_complete: Option<Rc<dyn Fn(f64, f64, f64, f64)>>,
     on_draw_complete: Option<Box<dyn Fn()>>,
+    on_origin_set: Option<Rc<dyn Fn()>>,
 }
 
 impl FloorPlanView {
@@ -132,6 +136,7 @@ impl FloorPlanView {
             zoom: 1.0,
             pan_x: 0.0,
             pan_y: 0.0,
+            needs_fit: true,
             pan_origin: None,
             last_mouse_pos: None,
             space_pressed: false,
@@ -151,12 +156,17 @@ impl FloorPlanView {
             on_measure_click: None,
             on_calibration_complete: None,
             on_draw_complete: None,
+            on_origin_set: None,
         }));
 
         // Draw function
         {
             let state = state.clone();
             area.set_draw_func(move |_area, ctx, w, h| {
+                {
+                    let mut s = state.borrow_mut();
+                    apply_pending_fit(&mut s, w as f64, h as f64);
+                }
                 draw_all(&state.borrow(), ctx, w, h);
             });
         }
@@ -180,9 +190,11 @@ impl FloorPlanView {
                     area.set_cursor_from_name(Some("grabbing"));
                     return;
                 }
+                // Normalization is relative to the map, not the widget.
+                let (mw, mh) = map_size(&s);
                 match s.mode {
                     DrawMode::Draw => {
-                        ensure_canvas(&mut s, area.width(), area.height());
+                        ensure_canvas(&mut s);
                         // Always snap to the visual grid corners
                         let (cx, cy) = widget_to_canvas(&s, x, y);
                         let px_step = grid_px_step(s.scale_px_per_m, s.grid_spacing_m);
@@ -193,12 +205,14 @@ impl FloorPlanView {
                     }
                     DrawMode::Measure => {
                         let (cx, cy) = widget_to_canvas(&s, x, y);
-                        let mut rx = cx / w;
-                        let mut ry = cy / h;
+                        let mut rx = cx / mw;
+                        let mut ry = cy / mh;
                         if s.snap_to_grid {
                             let px_step = grid_px_step(s.scale_px_per_m, s.measurement_grid_spacing_m);
-                            rx = ((cx / px_step).floor() + 0.5) * px_step / w;
-                            ry = ((cy / px_step).floor() + 0.5) * px_step / h;
+                            let origin = s.origin.map(|(rx, ry)| (rx * mw, ry * mh)).unwrap_or((0.0, 0.0));
+                            let (scx, scy) = cell_anchor(cx, cy, px_step, origin);
+                            rx = (scx + px_step / 2.0) / mw;
+                            ry = (scy + px_step / 2.0) / mh;
                         }
                         if let Some(ref cb) = s.on_measure_click {
                             cb(rx, ry);
@@ -206,12 +220,15 @@ impl FloorPlanView {
                     }
                     DrawMode::SetOrigin => {
                         let (cx, cy) = widget_to_canvas(&s, x, y);
-                        s.origin = Some((cx / w, cy / h));
+                        s.origin = Some((cx / mw, cy / mh));
+                        let cb = s.on_origin_set.clone();
+                        drop(s);
+                        if let Some(cb) = cb { cb(); }
                     }
                     DrawMode::Calibrate => {
                         let (cx, cy) = widget_to_canvas(&s, x, y);
-                        let rx = cx / w;
-                        let ry = cy / h;
+                        let rx = cx / mw;
+                        let ry = cy / mh;
                         if s.calib_a.is_none() {
                             s.calib_a = Some((rx, ry));
                             s.calib_b = None;
@@ -523,13 +540,19 @@ impl FloorPlanView {
 
     pub fn set_image(&self, path: &str) {
         if path.is_empty() {
-            self.state.borrow_mut().image = None;
+            let mut s = self.state.borrow_mut();
+            s.image = None;
+            s.needs_fit = true;
+            drop(s);
             self.widget.queue_draw();
             return;
         }
         match Pixbuf::from_file(path) {
             Ok(pb) => {
-                self.state.borrow_mut().image = pixbuf_to_surface(&pb);
+                let mut s = self.state.borrow_mut();
+                s.image = pixbuf_to_surface(&pb);
+                s.needs_fit = true;
+                drop(s);
                 self.widget.queue_draw();
             }
             Err(e) => log::warn!("Failed to load floor plan image {path}: {e}"),
@@ -538,7 +561,10 @@ impl FloorPlanView {
 
     pub fn set_pdf(&self, path: &str, page_idx: u32) {
         if let Some(surface) = pdf_page_to_surface(path, page_idx) {
-            self.state.borrow_mut().image = Some(surface);
+            let mut s = self.state.borrow_mut();
+            s.image = Some(surface);
+            s.needs_fit = true;
+            drop(s);
             self.widget.queue_draw();
         } else {
             log::warn!("Failed to render PDF page {} from {path}", page_idx);
@@ -641,6 +667,31 @@ impl FloorPlanView {
         self.widget.queue_draw();
     }
 
+    /// Set the calibration from two map-relative points and the known real
+    /// distance between them. Computes `scale_px_per_m` in map px per metre so
+    /// the grid stays physically correct at any window size. Returns the
+    /// computed scale (map px per metre), or `None` if it could not be computed.
+    pub fn set_calibration(&self, a: (f64, f64), b: (f64, f64), real_m: f64) -> Option<f64> {
+        let mut s = self.state.borrow_mut();
+        let (mw, mh) = map_size(&s);
+        let dx = (b.0 - a.0) * mw;
+        let dy = (b.1 - a.1) * mh;
+        let px_dist = (dx * dx + dy * dy).sqrt();
+        let scale = if px_dist > 0.0 && real_m > 0.0 {
+            Some(px_dist / real_m)
+        } else {
+            None
+        };
+        if let Some(scl) = scale {
+            s.scale_px_per_m = Some(scl);
+        }
+        s.calib_a = Some(a);
+        s.calib_b = Some(b);
+        drop(s);
+        self.widget.queue_draw();
+        scale
+    }
+
     pub fn get_calib_points(&self) -> (Option<(f64, f64)>, Option<(f64, f64)>) {
         let s = self.state.borrow();
         (s.calib_a, s.calib_b)
@@ -696,6 +747,10 @@ impl FloorPlanView {
         self.state.borrow_mut().on_draw_complete = Some(Box::new(cb));
     }
 
+    pub fn set_on_origin_set<F: Fn() + 'static>(&self, cb: F) {
+        self.state.borrow_mut().on_origin_set = Some(Rc::new(cb));
+    }
+
     // ── Zoom ───────────────────────────────────────────────────────────────
 
     /// Zoom in (1.25×), centred on the widget centre.
@@ -716,17 +771,64 @@ impl FloorPlanView {
         self.widget.queue_draw();
     }
 
-    /// Reset to 1:1 zoom with no pan offset.
+    /// Reset the view so the map is aspect-fit and centered in the widget.
     pub fn reset_zoom(&self) {
+        let wf = self.widget.width() as f64;
+        let hf = self.widget.height() as f64;
         let mut s = self.state.borrow_mut();
-        s.zoom  = 1.0;
-        s.pan_x = 0.0;
-        s.pan_y = 0.0;
+        if wf > 0.0 && hf > 0.0 {
+            let (mw, mh) = map_size(&s);
+            let (z, px, py) = fit_map_to_widget(mw, mh, wf, hf);
+            s.zoom = z;
+            s.pan_x = px;
+            s.pan_y = py;
+        }
+        s.needs_fit = false;
+        drop(s);
         self.widget.queue_draw();
     }
 }
 
 // ── Rendering ─────────────────────────────────────────────────────────────────
+
+/// Map size in map-space pixels. The map is the floor-plan image when one is
+/// loaded; otherwise a fixed default canvas is used.
+const DEFAULT_MAP_SIZE: f64 = 4096.0;
+
+/// Size of the current map in map-space pixels.
+fn map_size(state: &FloorPlanState) -> (f64, f64) {
+    match &state.image {
+        Some(img) => (img.width() as f64, img.height() as f64),
+        None => (DEFAULT_MAP_SIZE, DEFAULT_MAP_SIZE),
+    }
+}
+
+/// Zoom/pan that aspect-fits a `map_w × map_h` map into a `wf × hf` widget,
+/// centered. Returns `(zoom, pan_x, pan_y)` for the transform
+/// `screen = map * zoom + pan`.
+fn fit_map_to_widget(map_w: f64, map_h: f64, wf: f64, hf: f64) -> (f64, f64, f64) {
+    if map_w <= 0.0 || map_h <= 0.0 || wf <= 0.0 || hf <= 0.0 {
+        return (1.0, 0.0, 0.0);
+    }
+    let z = (wf / map_w).min(hf / map_h);
+    let px = (wf - map_w * z) / 2.0;
+    let py = (hf - map_h * z) / 2.0;
+    (z, px, py)
+}
+
+/// If a fit is pending and the widget is sized, (re)compute zoom/pan so the
+/// map is aspect-fit and centered in the widget.
+fn apply_pending_fit(s: &mut FloorPlanState, wf: f64, hf: f64) {
+    if !s.needs_fit || wf <= 0.0 || hf <= 0.0 {
+        return;
+    }
+    let (mw, mh) = map_size(s);
+    let (z, px, py) = fit_map_to_widget(mw, mh, wf, hf);
+    s.zoom = z;
+    s.pan_x = px;
+    s.pan_y = py;
+    s.needs_fit = false;
+}
 
 /// Convert a widget-space point to canvas (unzoomed) space.
 fn widget_to_canvas(s: &FloorPlanState, wx: f64, wy: f64) -> (f64, f64) {
@@ -745,6 +847,10 @@ fn apply_zoom(s: &mut FloorPlanState, factor: f64, cx: f64, cy: f64) {
 fn draw_all(state: &FloorPlanState, ctx: &Context, w: i32, h: i32) {
     let wf = w as f64;
     let hf = h as f64;
+    // The map (floor-plan image, or default canvas) is the single canonical
+    // coordinate space. All content is drawn in map space and transformed by
+    // zoom/pan, so it stays aligned with the map at any window size.
+    let (map_w, map_h) = map_size(state);
 
     // 1. Background — painted outside the zoom transform so it always fills the widget.
     ctx.set_source_rgb(0.12, 0.12, 0.12);
@@ -755,37 +861,30 @@ fn draw_all(state: &FloorPlanState, ctx: &Context, w: i32, h: i32) {
     ctx.translate(state.pan_x, state.pan_y);
     ctx.scale(state.zoom, state.zoom);
 
-    // 2. Floor plan image (dimmed, rendered before the grid so the grid appears on top)
-    if let Some(ref surface) = state.image {
-        let img_w = surface.width() as f64;
-        let img_h = surface.height() as f64;
-        let scale = (wf / img_w).min(hf / img_h);
-        let ox = (wf - img_w * scale) / 2.0;
-        let oy = (hf - img_h * scale) / 2.0;
+    // Visible rectangle in map space (used by the grid and to clamp the tooltip).
+    let vx0 = -state.pan_x / state.zoom;
+    let vy0 = -state.pan_y / state.zoom;
+    let vx1 = (wf - state.pan_x) / state.zoom;
+    let vy1 = (hf - state.pan_y) / state.zoom;
 
-        ctx.save().unwrap();
-        ctx.translate(ox, oy);
-        ctx.scale(scale, scale);
+    // 2. Floor plan image — drawn in map space at its native size, anchored at
+    // the map origin (so it is the map itself). Dimmed, rendered before the grid.
+    if let Some(ref surface) = state.image {
         ctx.set_source_surface(surface, 0.0, 0.0).unwrap();
         ctx.paint_with_alpha(0.55).unwrap();
-        ctx.restore().unwrap();
     }
 
     // 3. Grid (now above the floor plan image)
     if state.show_grid {
-        // Compute the visible canvas-space rectangle so the grid extends to fill it.
-        let vx0 = -state.pan_x / state.zoom;
-        let vy0 = -state.pan_y / state.zoom;
-        let vx1 = (wf - state.pan_x) / state.zoom;
-        let vy1 = (hf - state.pan_y) / state.zoom;
-        let origin_px = state.origin.map(|(rx, ry)| (rx * wf, ry * hf));
+        let origin_px = state.origin.map(|(rx, ry)| (rx * map_w, ry * map_h));
         draw_grid(ctx, vx0, vy0, vx1, vy1, state.scale_px_per_m, state.grid_spacing_m, origin_px);
     }
 
     // 3.5 Hover cell highlight (Measure mode only, uses measurement grid)
     if state.mode == DrawMode::Measure {
         if let Some((px, py)) = state.hover_pos {
-            draw_hover_highlight(ctx, px, py, state.scale_px_per_m, state.measurement_grid_spacing_m);
+            let origin = state.origin.map(|(rx, ry)| (rx * map_w, ry * map_h));
+            draw_hover_highlight(ctx, px, py, state.scale_px_per_m, state.measurement_grid_spacing_m, origin);
         }
     }
 
@@ -810,14 +909,15 @@ fn draw_all(state: &FloorPlanState, ctx: &Context, w: i32, h: i32) {
 
     // 5. Measurement cell coloring (replaces heatmap and individual dots)
     if state.show_heatmap && !state.measurements.is_empty() {
-        draw_measurement_cells(ctx, wf, hf, &state.measurements, state.scale_px_per_m, state.measurement_grid_spacing_m, state.color_metric, state.color_min, state.color_max);
+        let origin = state.origin.map(|(rx, ry)| (rx * map_w, ry * map_h));
+        draw_measurement_cells(ctx, map_w, map_h, &state.measurements, state.scale_px_per_m, state.measurement_grid_spacing_m, state.color_metric, state.color_min, state.color_max, origin);
     }
 
     // 6. Calibration visualization
-    draw_calibration(ctx, wf, hf, state);
+    draw_calibration(ctx, map_w, map_h, state);
 
     // 6.5 Origin marker
-    draw_origin(ctx, wf, hf, state);
+    draw_origin(ctx, map_w, map_h, state);
 
     // 7. Hover tooltip
     if state.tooltip_visible {
@@ -828,7 +928,7 @@ fn draw_all(state: &FloorPlanState, ctx: &Context, w: i32, h: i32) {
                 _ => None,
             };
             if let Some(t) = text {
-                draw_tooltip(ctx, px, py, wf, hf, t);
+                draw_tooltip(ctx, px, py, vx0, vy0, vx1, vy1, t);
             }
         }
     }
@@ -900,6 +1000,15 @@ fn grid_px_step(scale_px_per_m: Option<f64>, spacing_m: f64) -> f64 {
     }
 }
 
+/// Top-left corner of the cell containing `(px, py)`, where cell boundaries
+/// fall on `origin + k * px_step`. Anchoring everything (grid, cells, snap) to
+/// the same origin keeps them aligned.
+fn cell_anchor(px: f64, py: f64, px_step: f64, origin: (f64, f64)) -> (f64, f64) {
+    let cx = origin.0 + ((px - origin.0) / px_step).floor() * px_step;
+    let cy = origin.1 + ((py - origin.1) / px_step).floor() * px_step;
+    (cx, cy)
+}
+
 fn draw_measurement_cells(
     ctx: &Context,
     w: f64,
@@ -910,8 +1019,10 @@ fn draw_measurement_cells(
     metric: ColorMetric,
     min: f64,
     max: f64,
+    origin: Option<(f64, f64)>,
 ) {
     let px_step = grid_px_step(scale_px_per_m, spacing_m);
+    let (ox, oy) = origin.unwrap_or((0.0, 0.0));
     ctx.save().unwrap();
     for m in measurements {
         let val = match metric_value(m, metric) {
@@ -920,9 +1031,8 @@ fn draw_measurement_cells(
         };
         let px = m.x * w;
         let py = m.y * h;
-        // The measurement is stored at cell center; find cell origin
-        let cell_x = (px / px_step).floor() * px_step;
-        let cell_y = (py / px_step).floor() * px_step;
+        // The measurement is stored at cell center; find its cell (anchored to the origin).
+        let (cell_x, cell_y) = cell_anchor(px, py, px_step, (ox, oy));
         let (r, g, b) = value_color(val, min, max);
         ctx.set_source_rgba(r, g, b, 0.72);
         ctx.rectangle(cell_x, cell_y, px_step, px_step);
@@ -936,12 +1046,12 @@ fn draw_measurement_cells(
     ctx.restore().unwrap();
 }
 
-fn draw_hover_highlight(ctx: &Context, px: f64, py: f64, scale_px_per_m: Option<f64>, spacing_m: f64) {
+fn draw_hover_highlight(ctx: &Context, px: f64, py: f64, scale_px_per_m: Option<f64>, spacing_m: f64, origin: Option<(f64, f64)>) {
     let px_step = grid_px_step(scale_px_per_m, spacing_m);
+    let (ox, oy) = origin.unwrap_or((0.0, 0.0));
 
-    // Highlighted cell (floor to nearest grid line)
-    let cell_x = (px / px_step).floor() * px_step;
-    let cell_y = (py / px_step).floor() * px_step;
+    // Highlighted cell (anchored to the origin, so it lines up with the grid)
+    let (cell_x, cell_y) = cell_anchor(px, py, px_step, (ox, oy));
 
     ctx.save().unwrap();
     ctx.set_source_rgba(0.4, 0.7, 1.0, 0.22);
@@ -954,9 +1064,9 @@ fn draw_hover_highlight(ctx: &Context, px: f64, py: f64, scale_px_per_m: Option<
     ctx.rectangle(cell_x, cell_y, px_step, px_step);
     ctx.stroke().unwrap();
 
-    // Snap intersection dot (nearest grid corner)
-    let snap_x = (px / px_step).round() * px_step;
-    let snap_y = (py / px_step).round() * px_step;
+    // Snap intersection dot (nearest grid corner, anchored to the origin)
+    let snap_x = ox + ((px - ox) / px_step).round() * px_step;
+    let snap_y = oy + ((py - oy) / px_step).round() * px_step;
     ctx.set_source_rgba(0.5, 0.9, 1.0, 0.9);
     ctx.arc(snap_x, snap_y, 4.5, 0.0, std::f64::consts::TAU);
     ctx.fill().unwrap();
@@ -964,7 +1074,7 @@ fn draw_hover_highlight(ctx: &Context, px: f64, py: f64, scale_px_per_m: Option<
     ctx.restore().unwrap();
 }
 
-fn draw_tooltip(ctx: &Context, px: f64, py: f64, w: f64, h: f64, text: &str) {
+fn draw_tooltip(ctx: &Context, px: f64, py: f64, bx0: f64, by0: f64, bx1: f64, by1: f64, text: &str) {
     const PADDING: f64 = 8.0;
     const FONT_SIZE: f64 = 12.0;
     const CORNER_R: f64 = 5.0;
@@ -979,11 +1089,13 @@ fn draw_tooltip(ctx: &Context, px: f64, py: f64, w: f64, h: f64, text: &str) {
     let box_w = extents.width() + PADDING * 2.0;
     let box_h = FONT_SIZE + PADDING * 2.0;
 
-    // Position above the cursor, clamped to widget bounds
+    // Position above the cursor, clamped to the visible map-space rectangle.
+    let max_tx = (bx1 - box_w - 4.0).max(bx0 + 4.0);
+    let max_ty = (by1 - box_h - 4.0).max(by0 + 4.0);
     let mut tx = px - box_w / 2.0;
     let mut ty = py - box_h - 14.0;
-    tx = tx.clamp(4.0, w - box_w - 4.0);
-    ty = ty.clamp(4.0, h - box_h - 4.0);
+    tx = tx.clamp(bx0 + 4.0, max_tx);
+    ty = ty.clamp(by0 + 4.0, max_ty);
 
     // Rounded rectangle background
     ctx.new_sub_path();
@@ -1095,11 +1207,13 @@ fn draw_origin(ctx: &Context, w: f64, h: f64, state: &FloorPlanState) {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn ensure_canvas(state: &mut FloorPlanState, _w: i32, _h: i32) {
+fn ensure_canvas(state: &mut FloorPlanState) {
     if state.canvas.is_none() {
-        // Use a large fixed canvas so drawing is never clipped by the widget size.
-        // At a typical calibrated scale (~52 px/m) this covers ~78 m in each direction.
-        if let Ok(surface) = ImageSurface::create(Format::ARgb32, 4096, 4096) {
+        // The canvas is the map itself (same size as the floor-plan image, or
+        // the default map size when there is no image), so freehand drawing
+        // stays aligned with the map at any window size.
+        let (mw, mh) = map_size(state);
+        if let Ok(surface) = ImageSurface::create(Format::ARgb32, mw as i32, mh as i32) {
             state.canvas = Some(surface);
         }
     }
@@ -1156,5 +1270,95 @@ fn pdf_page_to_surface(path: &str, page_idx: u32) -> Option<ImageSurface> {
         page.render(&ctx);
     }
     Some(surface)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fit_map_to_widget_centers_square_map() {
+        // 1000x1000 map into a 800x600 widget -> scale by height (0.6), centered.
+        let (z, px, py) = fit_map_to_widget(1000.0, 1000.0, 800.0, 600.0);
+        assert!((z - 0.6).abs() < 1e-9);
+        // map width on screen = 1000*0.6 = 600, centered in 800 -> px = 100
+        assert!((px - 100.0).abs() < 1e-9);
+        // map height on screen = 600, centered in 600 -> py = 0
+        assert!(py.abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_fit_map_to_widget_landscape_map() {
+        // 1600x800 (2:1) map into 800x400 widget -> exact fit, no letterbox.
+        let (z, px, py) = fit_map_to_widget(1600.0, 800.0, 800.0, 400.0);
+        assert!((z - 0.5).abs() < 1e-9);
+        assert!(px.abs() < 1e-9);
+        assert!(py.abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_fit_map_to_widget_letterbox() {
+        // 1000x1000 map into a very wide 1000x400 widget -> scale by height (0.4),
+        // centered horizontally -> left/right margins of 300.
+        let (z, px, py) = fit_map_to_widget(1000.0, 1000.0, 1000.0, 400.0);
+        assert!((z - 0.4).abs() < 1e-9);
+        assert!((px - 300.0).abs() < 1e-9);
+        assert!(py.abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_fit_map_to_widget_roundtrip_maps_corners() {
+        // A point at the map's top-left corner must map to the on-screen rect origin.
+        let (mw, mh, wf, hf) = (1000.0, 500.0, 800.0, 600.0);
+        let (z, px, py) = fit_map_to_widget(mw, mh, wf, hf);
+        // top-left of map -> (px, py)
+        let (sx, sy) = (0.0 * z + px, 0.0 * z + py);
+        assert!((sx - px).abs() < 1e-9);
+        assert!((sy - py).abs() < 1e-9);
+        // bottom-right of map -> (px + mw*z, py + mh*z)
+        let (ex, ey) = (mw * z + px, mh * z + py);
+        assert!(ex <= wf && ey <= hf);
+        assert!((ex - px - mw * z).abs() < 1e-9);
+        assert!((ey - py - mh * z).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_fit_map_to_widget_degenerate_inputs_fallback() {
+        // Zero-sized map or widget -> safe fallback (zoom 1, no pan).
+        assert_eq!(fit_map_to_widget(0.0, 100.0, 800.0, 600.0), (1.0, 0.0, 0.0));
+        assert_eq!(fit_map_to_widget(100.0, 100.0, 0.0, 0.0), (1.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn test_cell_anchor_at_zero_origin() {
+        // With no origin, cells are anchored to the top-left (0,0).
+        assert_eq!(cell_anchor(37.0, 91.0, 10.0, (0.0, 0.0)), (30.0, 90.0));
+        assert_eq!(cell_anchor(10.0, 10.0, 10.0, (0.0, 0.0)), (10.0, 10.0));
+        assert_eq!(cell_anchor(0.0, 0.0, 10.0, (0.0, 0.0)), (0.0, 0.0));
+    }
+
+    #[test]
+    fn test_cell_anchor_offset_origin() {
+        // With an origin at (50, 20), cell boundaries fall on origin + k*step.
+        // Point just right of the origin -> cell starts at the origin x.
+        assert_eq!(cell_anchor(55.0, 22.0, 10.0, (50.0, 20.0)), (50.0, 20.0));
+        // Point two cells over -> cell starts at origin.x + 2*step.
+        assert_eq!(cell_anchor(71.0, 20.0, 10.0, (50.0, 20.0)), (70.0, 20.0));
+        // Point left of the origin -> cell starts one step before the origin x.
+        assert_eq!(cell_anchor(41.0, 20.0, 10.0, (50.0, 20.0)), (40.0, 20.0));
+    }
+
+    #[test]
+    fn test_cell_anchor_aligns_with_grid() {
+        // A cell boundary computed from a point must coincide with a grid line
+        // (origin + k*step), so cells and grid lines line up.
+        let (ox, oy) = (33.0, 7.0);
+        let step = 12.0;
+        let (cx, cy) = cell_anchor(100.0, 60.0, step, (ox, oy));
+        let kx = ((cx - ox) / step).round();
+        let ky = ((cy - oy) / step).round();
+        assert!((cx - (ox + kx * step)).abs() < 1e-9);
+        assert!((cy - (oy + ky * step)).abs() < 1e-9);
+    }
 }
 

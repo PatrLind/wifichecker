@@ -96,10 +96,14 @@ fn auto_save(fp: &FloorPlanView, state: &Rc<RefCell<AppState>>) {
         log::warn!("Failed to create drawings dir {}: {e}", canvas_dir.display());
     }
     let canvas_path = canvas_dir.join(format!("floor_{idx}.png"));
-    if fp.save_canvas(&canvas_path).is_ok() {
+    {
         let mut s = state.borrow_mut();
         if let Some(floor) = s.project.floors.get_mut(idx) {
-            floor.drawing_path = Some(canvas_path.to_string_lossy().to_string());
+            // Only update drawing_path if a canvas was actually saved.
+            if fp.save_canvas(&canvas_path).is_ok() {
+                floor.drawing_path = Some(canvas_path.to_string_lossy().to_string());
+            }
+            // Origin is always persisted, independent of whether there is a drawing.
             floor.origin = fp.get_origin();
         }
     }
@@ -608,14 +612,7 @@ fn build_ui(
                 let Ok(real_m) = text.trim().parse::<f64>() else { return; };
                 if real_m <= 0.0 { return; }
 
-                let w = fp2.widget.width() as f64;
-                let h = fp2.widget.height() as f64;
-                let dx = (bx - ax) * w;
-                let dy = (by - ay) * h;
-                let px_dist = (dx * dx + dy * dy).sqrt();
-                let scale = px_dist / real_m;
-
-                fp2.set_scale(scale, (ax, ay), (bx, by));
+                let Some(scale) = fp2.set_calibration((ax, ay), (bx, by), real_m) else { return; };
 
                 {
                     let mut s = state2.borrow_mut();
@@ -637,6 +634,17 @@ fn build_ui(
         let state = state.clone();
         floor_plan.set_on_draw_complete(move || {
             auto_save(&fp, &state);
+        });
+    }
+
+    // Persist the origin immediately when it is placed (so it survives reload)
+    {
+        let fp = floor_plan.clone();
+        let state = state.clone();
+        let overlay_ref = overlay.clone();
+        floor_plan.set_on_origin_set(move || {
+            auto_save(&fp, &state);
+            overlay_ref.add_toast(Toast::new("Origin updated"));
         });
     }
 
