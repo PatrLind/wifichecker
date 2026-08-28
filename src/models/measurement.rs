@@ -16,6 +16,16 @@ pub struct ScanEntry {
     /// True for the AP the computer is currently associated with.
     #[serde(default)]
     pub is_active: bool,
+    /// Channel width in MHz (20/40/80/160/320); 80+80 stored as 160.
+    /// Unknown for old measurements.
+    #[serde(default)]
+    pub channel_width_mhz: Option<u32>,
+    /// Center frequency 1 in MHz.
+    #[serde(default)]
+    pub center_freq_mhz: Option<u32>,
+    /// Center frequency 2 in MHz (80+80 only).
+    #[serde(default)]
+    pub center_freq2_mhz: Option<u32>,
 }
 
 impl ScanEntry {
@@ -43,6 +53,18 @@ pub struct Measurement {
     pub link_speed_mbps: Option<u32>,
     pub iperf_mbps: Option<f64>,
     pub smb_mbps: Option<f64>,
+    /// Channel width in MHz (20/40/80/160/320); 80+80 stored as 160.
+    #[serde(default)]
+    pub channel_width_mhz: Option<u32>,
+    /// Center frequency 1 in MHz.
+    #[serde(default)]
+    pub center_freq_mhz: Option<u32>,
+    /// Center frequency 2 in MHz (80+80 only).
+    #[serde(default)]
+    pub center_freq2_mhz: Option<u32>,
+    /// The WiFi interface this measurement was taken on (e.g. "wlan0").
+    #[serde(default)]
+    pub device: Option<String>,
     /// True when this point records "no WiFi reception" (WiFi off or not
     /// connected) — used to mark dead zones on the coverage map.
     #[serde(default)]
@@ -69,6 +91,10 @@ impl Measurement {
             link_speed_mbps: None,
             iperf_mbps: None,
             smb_mbps: None,
+            channel_width_mhz: None,
+            center_freq_mhz: None,
+            center_freq2_mhz: None,
+            device: None,
             no_signal: false,
             scan_results: Vec::new(),
         }
@@ -91,6 +117,10 @@ impl Measurement {
             link_speed_mbps: None,
             iperf_mbps: None,
             smb_mbps: None,
+            channel_width_mhz: None,
+            center_freq_mhz: None,
+            center_freq2_mhz: None,
+            device: None,
             no_signal: true,
             scan_results: Vec::new(),
         }
@@ -203,9 +233,9 @@ mod tests {
 
     #[test]
     fn test_scan_entry_band() {
-        let e24 = ScanEntry { ssid: "A".into(), bssid: "B".into(), frequency_mhz: 2437, channel: 6, signal_dbm: -60, is_active: false };
-        let e5 = ScanEntry { ssid: "A".into(), bssid: "B".into(), frequency_mhz: 5180, channel: 36, signal_dbm: -60, is_active: true };
-        let e6 = ScanEntry { ssid: "A".into(), bssid: "B".into(), frequency_mhz: 5955, channel: 5, signal_dbm: -60, is_active: false };
+        let e24 = ScanEntry { ssid: "A".into(), bssid: "B".into(), frequency_mhz: 2437, channel: 6, signal_dbm: -60, is_active: false, channel_width_mhz: None, center_freq_mhz: None, center_freq2_mhz: None };
+        let e5 = ScanEntry { ssid: "A".into(), bssid: "B".into(), frequency_mhz: 5180, channel: 36, signal_dbm: -60, is_active: true, channel_width_mhz: Some(40), center_freq_mhz: Some(5190), center_freq2_mhz: None };
+        let e6 = ScanEntry { ssid: "A".into(), bssid: "B".into(), frequency_mhz: 5955, channel: 5, signal_dbm: -60, is_active: false, channel_width_mhz: None, center_freq_mhz: None, center_freq2_mhz: None };
         assert_eq!(e24.band(), "2.4 GHz");
         assert_eq!(e5.band(), "5 GHz");
         assert_eq!(e6.band(), "6 GHz");
@@ -215,14 +245,30 @@ mod tests {
     fn test_measurement_json_with_scan_results_roundtrip() {
         let mut m = make_measurement(-60);
         m.scan_results = vec![
-            ScanEntry { ssid: "MyHome".into(), bssid: "AA:BB:CC:DD:EE:01".into(), frequency_mhz: 5180, channel: 36, signal_dbm: -55, is_active: true },
-            ScanEntry { ssid: "MyHome".into(), bssid: "AA:BB:CC:DD:EE:02".into(), frequency_mhz: 2437, channel: 6, signal_dbm: -70, is_active: false },
+            ScanEntry { ssid: "MyHome".into(), bssid: "AA:BB:CC:DD:EE:01".into(), frequency_mhz: 5180, channel: 36, signal_dbm: -55, is_active: true, channel_width_mhz: Some(40), center_freq_mhz: Some(5190), center_freq2_mhz: None },
+            ScanEntry { ssid: "MyHome".into(), bssid: "AA:BB:CC:DD:EE:02".into(), frequency_mhz: 2437, channel: 6, signal_dbm: -70, is_active: false, channel_width_mhz: None, center_freq_mhz: None, center_freq2_mhz: None },
         ];
         let json = serde_json::to_string(&m).unwrap();
         let m2: Measurement = serde_json::from_str(&json).unwrap();
         assert_eq!(m2.scan_results.len(), 2);
         assert!(m2.scan_results[0].is_active);
         assert_eq!(m2.scan_results[1].bssid, "AA:BB:CC:DD:EE:02");
+        assert_eq!(m2.scan_results[0].channel_width_mhz, Some(40));
+    }
+
+    #[test]
+    fn test_measurement_json_without_new_fields_uses_defaults() {
+        // Old saved projects have none of the new channel fields; they
+        // should all default (empty/None) and load unchanged.
+        let json = r#"{"id":"x","x":0.5,"y":0.5,"timestamp":"2024-01-01T00:00:00Z","ssid":"A","bssid":"B","frequency_mhz":2412,"channel":1,"signal_dbm":-70,"noise_dbm":null,"link_speed_mbps":null,"iperf_mbps":null,"smb_mbps":null,"scan_results":[{"ssid":"A","bssid":"B","frequency_mhz":2412,"channel":1,"signal_dbm":-70}]}"#;
+        let m: Measurement = serde_json::from_str(json).unwrap();
+        assert!(m.channel_width_mhz.is_none());
+        assert!(m.center_freq_mhz.is_none());
+        assert!(m.center_freq2_mhz.is_none());
+        assert!(m.device.is_none());
+        assert_eq!(m.scan_results.len(), 1);
+        assert!(m.scan_results[0].channel_width_mhz.is_none());
+        assert!(m.scan_results[0].center_freq_mhz.is_none());
     }
 
     #[test]

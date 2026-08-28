@@ -1124,6 +1124,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "genetlink"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0bc61df27194def0f714249ee8a5abb15f031daa8d1eff1c0bf661aee80203d"
+dependencies = [
+ "futures",
+ "log",
+ "netlink-packet-core",
+ "netlink-packet-generic",
+ "netlink-proto",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "getrandom"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1904,6 +1918,50 @@ dependencies = [
 ]
 
 [[package]]
+name = "netlink-packet-core"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d6e2daf9a8c2e21302714706860a0e6be02e03d17294ecc66b354ea7d4059dd"
+
+[[package]]
+name = "netlink-packet-generic"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e609a7be61318181c110df304d54ed3f3e129b9569b8ca16e40a9d644f46930c"
+dependencies = [
+ "netlink-packet-core",
+ "zerocopy",
+]
+
+[[package]]
+name = "netlink-proto"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97e03ae6247c6cdb499e8f14e98c72b83954d85822b687056e3a21150b438f2b"
+dependencies = [
+ "bytes",
+ "futures-channel",
+ "futures-util",
+ "log",
+ "netlink-packet-core",
+ "netlink-sys",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "netlink-sys"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c99d38e00b420df49e940fe0826e667c3dad82ac68eb4c2bbf754c1c14a83a10"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "libc",
+ "log",
+ "tokio",
+]
+
+[[package]]
 name = "num-conv"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2122,7 +2180,7 @@ dependencies = [
  "sha3",
  "signature",
  "spki",
- "thiserror",
+ "thiserror 2.0.20",
  "x25519-dalek",
  "zeroize",
 ]
@@ -2193,7 +2251,7 @@ dependencies = [
  "rand 0.10.0-rc.6",
  "serde",
  "sha1",
- "thiserror",
+ "thiserror 2.0.20",
  "uuid",
 ]
 
@@ -2375,7 +2433,7 @@ dependencies = [
  "rustc-hash",
  "rustls",
  "socket2",
- "thiserror",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "web-time",
@@ -2396,7 +2454,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "slab",
- "thiserror",
+ "thiserror 2.0.20",
  "tinyvec",
  "tracing",
  "web-time",
@@ -2975,7 +3033,7 @@ dependencies = [
  "smb-rpc",
  "smb-transport",
  "sspi",
- "thiserror",
+ "thiserror 2.0.20",
  "time",
  "tokio",
  "tokio-stream",
@@ -3018,7 +3076,7 @@ dependencies = [
  "modular-bitfield",
  "pastey",
  "smb-dtyp",
- "thiserror",
+ "thiserror 2.0.20",
  "time",
 ]
 
@@ -3034,7 +3092,7 @@ dependencies = [
  "smb-dtyp",
  "smb-fscc",
  "smb-msg-derive",
- "thiserror",
+ "thiserror 2.0.20",
  "time",
 ]
 
@@ -3060,7 +3118,7 @@ dependencies = [
  "modular-bitfield",
  "pastey",
  "smb-dtyp",
- "thiserror",
+ "thiserror 2.0.20",
  "time",
 ]
 
@@ -3078,7 +3136,7 @@ dependencies = [
  "modular-bitfield",
  "pastey",
  "smb-dtyp",
- "thiserror",
+ "thiserror 2.0.20",
  "time",
  "tokio",
  "tokio-util",
@@ -3207,6 +3265,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "syn"
+version = "3.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6275cddf4610d1775e6d1fe9469b2e77d0f39fd98fb7450901b821e0c53649f"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
 name = "sync_wrapper"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3260,22 +3329,42 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "2.0.18"
+version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4288b5bcbc7920c07a1149a35cf9590a2aa808e0bc1eafaade0b80947865fbc4"
+checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
 dependencies = [
- "thiserror-impl",
+ "thiserror-impl 1.0.69",
+]
+
+[[package]]
+name = "thiserror"
+version = "2.0.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f"
+dependencies = [
+ "thiserror-impl 2.0.20",
 ]
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.18"
+version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ebc4ee7f67670e9b64d05fa4253e753e016c6c95ff35b89b7941d6b856dec1d5"
+checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
 dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "2.0.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc04cd3e1236dd4a98afca4569f2deb3f120e5422a4023be2cb683f8486292af"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.4",
 ]
 
 [[package]]
@@ -3734,13 +3823,14 @@ checksum = "72069c3113ab32ab29e5584db3c6ec55d416895e60715417b5b883a357c3e471"
 
 [[package]]
 name = "wifichecker"
-version = "0.2.2-patrlind-1"
+version = "0.2.2-patrlind-2"
 dependencies = [
  "anyhow",
  "async-channel",
  "cairo-rs",
  "chrono",
  "env_logger",
+ "futures",
  "gdk-pixbuf",
  "gtk4",
  "libadwaita",
@@ -3751,6 +3841,7 @@ dependencies = [
  "serde_json",
  "smb",
  "tokio",
+ "wl-nl80211",
  "zbus",
 ]
 
@@ -4002,6 +4093,24 @@ name = "wit-bindgen"
 version = "0.51.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7249219f66ced02969388cf2bb044a09756a083d0fab1e566056b04d9fbcaa5"
+
+[[package]]
+name = "wl-nl80211"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91c6509ed5d2d645aa737ef80f162b9cd94d2e5805a3f6a6cece2d413e7bd63f"
+dependencies = [
+ "bitflags 2.11.0",
+ "futures",
+ "genetlink",
+ "log",
+ "netlink-packet-core",
+ "netlink-packet-generic",
+ "netlink-proto",
+ "netlink-sys",
+ "thiserror 2.0.20",
+ "tokio",
+]
 
 [[package]]
 name = "writeable"

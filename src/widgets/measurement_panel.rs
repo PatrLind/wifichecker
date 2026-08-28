@@ -17,6 +17,9 @@ struct CurrentSignalState {
     freq: u32,
     channel: u8,
     device: String,
+    channel_width_mhz: Option<u32>,
+    center_freq_mhz: Option<u32>,
+    center_freq2_mhz: Option<u32>,
     iperf_mbps: Option<f64>,
     smb_mbps: Option<f64>,
     scan_list: Option<Vec<WifiInfo>>,
@@ -122,7 +125,7 @@ impl MeasurementPanel {
         selected_label.set_wrap(true);
         selected_label.add_css_class("caption");
         // Opens the full list of the other networks seen at the selected point.
-        let details_more_btn = gtk4::Button::with_label("Other networks…");
+        let details_more_btn = gtk4::Button::with_label("All networks in range…");
         details_more_btn.add_css_class("flat");
         details_more_btn.set_halign(gtk4::Align::Start);
         details_more_btn.set_visible(false);
@@ -255,25 +258,40 @@ impl MeasurementPanel {
         panel
     }
 
-    /// Popup with the full list of the other networks (APs not broadcasting
-    /// the measured SSID) seen at the selected point.
+    /// Popup with the full list of all networks (APs) seen at the selected
+    /// point, including the measured/target SSID (marked with ●).
     fn show_other_networks(&self) {
         let Some(id) = self.selected_id() else { return };
-        let (m, aliases) = {
+        let (m, aliases, floor_ssids) = {
             let measurements = self.measurements.borrow();
             let aliases = self.aliases.borrow();
             match measurements.iter().find(|m| m.id == id) {
-                Some(m) => (m.clone(), aliases.clone()),
+                Some(m) => (
+                    m.clone(),
+                    aliases.clone(),
+                    Self::floor_ssids(&measurements),
+                ),
                 None => return,
             }
         };
-        let other: Vec<&crate::models::ScanEntry> =
-            m.scan_results.iter().filter(|e| e.ssid != m.ssid).collect();
-        if other.is_empty() {
+        let all: Vec<&crate::models::ScanEntry> = m.scan_results.iter().collect();
+        if all.is_empty() {
             return;
         }
-        let other_count = other.len();
-        let text = format!("{other_count} other APs in range at this point:\n\n{}", format_ap_table(&other, &aliases));
+        let count = all.len();
+        // Mark the target AP(s): the connected AP for regular measurements,
+        // or the APs of this floor's measured SSIDs for no-signal points.
+        let mut marks: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if m.no_signal {
+            for e in &all {
+                if floor_ssids.contains(&e.ssid) {
+                    marks.insert(e.bssid.clone());
+                }
+            }
+        } else if !m.bssid.is_empty() {
+            marks.insert(m.bssid.clone());
+        }
+        let text = format!("{count} APs in range at this point:\n\n{}", format_ap_table(&all, &aliases, &marks));
         // Find the enclosing top-level window (for transient_for stacking).
         let mut parent: Option<gtk4::Widget> = self.widget.parent();
         let mut win: Option<gtk4::Window> = None;
@@ -285,7 +303,7 @@ impl MeasurementPanel {
             parent = w.parent();
         }
         let mut builder = gtk4::Window::builder()
-            .title(format!("Other networks — {other_count} APs"))
+            .title(format!("All networks in range — {count} APs"))
             .modal(true)
             .default_width(560)
             .default_height(420);
@@ -308,6 +326,18 @@ impl MeasurementPanel {
         dialog.present();
     }
 
+    /// The distinct SSIDs of this floor's regular (connected) measurements,
+    /// in first-seen order — "the networks this floor is measuring".
+    fn floor_ssids(measurements: &[Measurement]) -> Vec<String> {
+        let mut seen = Vec::new();
+        for m in measurements.iter() {
+            if !m.no_signal && !m.ssid.is_empty() && !seen.contains(&m.ssid) {
+                seen.push(m.ssid.clone());
+            }
+        }
+        seen
+    }
+
     /// Show or hide the measuring spinner with a status message.
     pub fn set_measuring(&self, active: bool, msg: &str) {
         if active {
@@ -328,6 +358,9 @@ impl MeasurementPanel {
         freq: u32,
         channel: u8,
         device: &str,
+        channel_width_mhz: Option<u32>,
+        center_freq_mhz: Option<u32>,
+        center_freq2_mhz: Option<u32>,
         iperf_mbps: Option<f64>,
         smb_mbps: Option<f64>,
         _unit: ThroughputUnit,
@@ -340,6 +373,9 @@ impl MeasurementPanel {
             freq,
             channel,
             device: device.to_string(),
+            channel_width_mhz,
+            center_freq_mhz,
+            center_freq2_mhz,
             iperf_mbps,
             smb_mbps,
             scan_list: scan_list.map(|l| l.to_vec()),
@@ -357,9 +393,14 @@ impl MeasurementPanel {
         let band = crate::models::band_label(input.freq);
         let quality = signal_quality_str(input.dbm);
         let bssid_label = ap_full_label(&self.aliases.borrow(), &input.bssid);
+        let ch_suffix = crate::models::width_center_suffix(
+            input.channel_width_mhz,
+            input.center_freq_mhz,
+            input.center_freq2_mhz,
+        );
         let mut text = format!(
-            "SSID: {}\nBSSID: {}\nSignal: {} dBm ({})\nBand: {} | Ch: {}\nCard: {}",
-            input.ssid, bssid_label, input.dbm, quality, band, input.channel, input.device
+            "SSID: {}\nBSSID: {}\nSignal: {} dBm ({})\nBand: {} | Ch: {}{}\nCard: {}",
+            input.ssid, bssid_label, input.dbm, quality, band, input.channel, ch_suffix, input.device
         );
         if let Some(mbps) = input.iperf_mbps {
             text.push_str(&format!("\niperf3: {}", unit.format(mbps)));
@@ -396,8 +437,24 @@ impl MeasurementPanel {
 
     /// Refresh the live Current Signal with the active AP. No throughput is
     /// shown — that only appears right after a measurement (update_current_wifi).
-    pub fn refresh_live_signal(&self, ssid: &str, bssid: &str, dbm: i32, freq: u32, channel: u8, device: &str, scan_list: Option<&[WifiInfo]>) {
-        self.update_current_wifi(ssid, bssid, dbm, freq, channel, device, None, None, *self.unit.borrow(), scan_list);
+    pub fn refresh_live_signal(
+        &self,
+        ssid: &str,
+        bssid: &str,
+        dbm: i32,
+        freq: u32,
+        channel: u8,
+        device: &str,
+        channel_width_mhz: Option<u32>,
+        center_freq_mhz: Option<u32>,
+        center_freq2_mhz: Option<u32>,
+        scan_list: Option<&[WifiInfo]>,
+    ) {
+        self.update_current_wifi(
+            ssid, bssid, dbm, freq, channel, device,
+            channel_width_mhz, center_freq_mhz, center_freq2_mhz,
+            None, None, *self.unit.borrow(), scan_list,
+        );
     }
 
     pub fn set_on_device_changed<F: Fn(String) + 'static>(&self, cb: F) {
@@ -453,15 +510,18 @@ impl MeasurementPanel {
     /// Update the "Selected Measurement" section and highlight/scroll to the
     /// matching list row. Pass `None` to clear the selection.
     pub fn set_selected_by_id(&self, id: Option<String>) {
-        let (text, other_count) = {
+        let (text, scan_count) = {
             let measurements = self.measurements.borrow();
             let unit = self.unit.borrow();
             let source = self.signal_source.borrow();
             let aliases = self.aliases.borrow();
             match id.as_ref().and_then(|id| measurements.iter().find(|m| &m.id == id)) {
                 Some(m) => {
-                    let other = m.scan_results.iter().filter(|e| e.ssid != m.ssid).count();
-                    (format_measurement_details(m, &unit, &source, &aliases), other)
+                    let floor_ssids = Self::floor_ssids(&measurements);
+                    (
+                        format_measurement_details(m, &unit, &source, &aliases, &floor_ssids),
+                        m.scan_results.len(),
+                    )
                 }
                 None => (
                     "No measurement selected — use the Select tool and click a point on the map.".to_string(),
@@ -470,12 +530,12 @@ impl MeasurementPanel {
             }
         };
         self.selected_label.set_label(&text);
-        // The "other networks" button shows when the point's scan list has
-        // APs beyond the measured SSID.
-        self.details_more_btn.set_visible(other_count > 0);
-        if other_count > 0 {
+        // The "all networks" button shows when the point has a recorded scan
+        // list (including no-signal points with a scan).
+        self.details_more_btn.set_visible(scan_count > 0);
+        if scan_count > 0 {
             self.details_more_btn
-                .set_label(&format!("All other networks ({other_count} APs) ▸"));
+                .set_label(&format!("All networks in range ({scan_count} APs) ▸"));
         }
 
         let rows = self.rows.borrow();
@@ -560,7 +620,10 @@ impl MeasurementPanel {
         hbox.set_margin_bottom(4);
 
         let info_str = if m.no_signal {
-            format!("⚫ No signal | {}", m.timestamp.format("%H:%M:%S"))
+            // "No connection" when APs were in range at the point, "No
+            // signal" when the scan found nothing (true dead zone).
+            let label = if m.scan_results.is_empty() { "No signal" } else { "No connection" };
+            format!("⚫ {label} | {}", m.timestamp.format("%H:%M:%S"))
         } else {
             let source = self.signal_source.borrow();
             // The dBm shown follows the active signal source; "—" means the
@@ -629,6 +692,9 @@ mod tests {
             link_speed_mbps: None,
             device: "wlan0".to_string(),
             is_active: active,
+            channel_width_mhz: None,
+            center_freq_mhz: None,
+            center_freq2_mhz: None,
         }
     }
 
@@ -640,6 +706,9 @@ mod tests {
             channel: 36,
             signal_dbm: dbm,
             is_active: active,
+            channel_width_mhz: None,
+            center_freq_mhz: None,
+            center_freq2_mhz: None,
         }
     }
 
@@ -687,7 +756,7 @@ mod tests {
         let e1 = entry("FF:FF:FF:FF:FF:01", "VeryLongNetworkNameHere", -60, false);
         let e2 = entry("FF:FF:FF:FF:FF:02", "Noise", -100, false);
         let scan = vec![&e24, &e1, &e2];
-        let text = format_ap_table(&scan, &HashMap::new());
+        let text = format_ap_table(&scan, &HashMap::new(), &std::collections::HashSet::new());
         let lines: Vec<&str> = text.trim_end().split('\n').collect();
         // Header + separator + 3 rows.
         assert_eq!(lines.len(), 5);
@@ -707,7 +776,7 @@ mod tests {
         let mut e = entry("AA:BB:CC:DD:EE:01", "Home", -55, true);
         e.ssid = String::new();
         let scan = vec![&e];
-        let text = format_ap_table(&scan, &HashMap::new());
+        let text = format_ap_table(&scan, &HashMap::new(), &std::collections::HashSet::new());
         assert!(text.contains("(hidden)"));
     }
 
@@ -743,18 +812,54 @@ mod tests {
     }
 }
 
-fn format_measurement_details(m: &Measurement, unit: &ThroughputUnit, source: &SignalSource, aliases: &HashMap<String, String>) -> String {
+fn format_measurement_details(m: &Measurement, unit: &ThroughputUnit, source: &SignalSource, aliases: &HashMap<String, String>, floor_ssids: &[String]) -> String {
     if m.no_signal {
-        return format!(
-            "No signal (dead zone)\nTime: {}",
+        let head = if m.scan_results.is_empty() {
+            "No signal (dead zone)"
+        } else {
+            "No connection"
+        };
+        let mut text = format!(
+            "{}\nTime: {}",
+            head,
             m.timestamp.format("%m-%d %H:%M:%S")
         );
+        if !m.scan_results.is_empty() {
+            text.push_str(&format!("\nNetworks in range: {}", m.scan_results.len()));
+            // The networks this floor is measuring: strongest detected
+            // signal, or "not detected".
+            for ssid in floor_ssids {
+                let best = m
+                    .scan_results
+                    .iter()
+                    .filter(|e| &e.ssid == ssid)
+                    .max_by_key(|e| e.signal_dbm);
+                match best {
+                    Some(e) => {
+                        let tag = crate::models::width_tag(e.channel_width_mhz, e.center_freq2_mhz)
+                            .map(|t| format!(" {t}"))
+                            .unwrap_or_default();
+                        text.push_str(&format!(
+                            "\n  {ssid}: {} dBm (ch{} {}{})",
+                            e.signal_dbm, e.channel, e.band(), tag
+                        ));
+                    }
+                    None => text.push_str(&format!("\n  {ssid}: not detected")),
+                }
+            }
+        }
+        return text;
     }
     let band = crate::models::band_label(m.frequency_mhz);
     let bssid_label = ap_full_label(aliases, &m.bssid);
+    let ch_suffix = crate::models::width_center_suffix(
+        m.channel_width_mhz,
+        m.center_freq_mhz,
+        m.center_freq2_mhz,
+    );
     let mut text = format!(
-        "SSID: {}\nBSSID: {}\nSignal: {} dBm ({})\nBand: {} | Ch: {} | {} MHz\nTime: {}",
-        m.ssid, bssid_label, m.signal_dbm, signal_quality_str(m.signal_dbm), band, m.channel, m.frequency_mhz,
+        "SSID: {}\nBSSID: {}\nSignal: {} dBm ({})\nBand: {} | Ch: {} | {} MHz{}\nTime: {}",
+        m.ssid, bssid_label, m.signal_dbm, signal_quality_str(m.signal_dbm), band, m.channel, m.frequency_mhz, ch_suffix,
         m.timestamp.format("%m-%d %H:%M:%S")
     );
     // When a non-default signal source is active, show the filtered value too.
@@ -814,20 +919,43 @@ fn same_ssid_group_text(ssid: &str, list: &[WifiInfo], aliases: &HashMap<String,
         } else {
             crate::models::band_label(e.frequency_mhz).to_string()
         };
-        text.push_str(&format!("\n{marker}{label}  {} dBm{}", e.signal_dbm, ch));
+        let tag = crate::models::width_tag(e.channel_width_mhz, e.center_freq2_mhz)
+            .map(|t| format!(" {t}"))
+            .unwrap_or_default();
+        text.push_str(&format!("\n{marker}{label}  {} dBm{}{}", e.signal_dbm, ch, tag));
     }
     Some(text)
 }
 
-/// ASCII column-aligned table of APs (for the "other networks" popup).
+/// ASCII column-aligned table of APs (for the "all networks" popup).
 /// All columns are fixed width so rows line up in a monospace font.
-fn format_ap_table(entries: &[&crate::models::ScanEntry], aliases: &HashMap<String, String>) -> String {
+/// `marks`: BSSIDs to highlight with ● (the target network's APs).
+fn format_ap_table(
+    entries: &[&crate::models::ScanEntry],
+    aliases: &HashMap<String, String>,
+    marks: &std::collections::HashSet<String>,
+) -> String {
+    let ssid_text = |e: &crate::models::ScanEntry| {
+        let base = if e.ssid.is_empty() {
+            "(hidden)".to_string()
+        } else {
+            e.ssid.clone()
+        };
+        if marks.contains(&e.bssid) {
+            format!("● {base}")
+        } else {
+            base
+        }
+    };
+    let width_text = |e: &crate::models::ScanEntry| {
+        crate::models::width_tag(e.channel_width_mhz, e.center_freq2_mhz).unwrap_or_default()
+    };
     let ssid_w = entries
         .iter()
-        .map(|e| if e.ssid.is_empty() { 8 } else { e.ssid.len() })
+        .map(|e| ssid_text(e).len())
         .max()
         .unwrap_or(4)
-        .min(24)
+        .min(26)
         .max(4);
     // The AP column holds "alias (MAC)" when an alias is set — size it to fit.
     let ap_w = entries
@@ -836,23 +964,52 @@ fn format_ap_table(entries: &[&crate::models::ScanEntry], aliases: &HashMap<Stri
         .max()
         .unwrap_or(17)
         .max(17);
-    let mut text = format!(
-        "{:<ssid_w$}  {:<ap_w$}  {:>7}  {:>3}  {:>7}\n",
-        "SSID", "AP", "SIGNAL", "CH", "BAND"
-    );
-    text.push_str(&format!(
-        "{:-<ssid_w$}  {:<ap_w$}  {:->7}  {:->3}  {:->7}\n",
-        "", "", "-------", "---", "-------"
-    ));
-    for e in entries {
-        let ssid = if e.ssid.is_empty() { "(hidden)" } else { e.ssid.as_str() };
-        let label = ap_full_label(aliases, &e.bssid);
+    // The WIDTH column is hidden entirely when no entry has width data
+    // (old projects keep the original table shape).
+    let show_width = entries.iter().any(|e| !width_text(e).is_empty());
+    let w_w = entries
+        .iter()
+        .map(|e| width_text(e).len())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    if show_width {
+        let mut text = format!(
+            "{:<ssid_w$}  {:<ap_w$}  {:>7}  {:>3}  {:<w_w$}  {:>7}\n",
+            "SSID", "AP", "SIGNAL", "CH", "WIDTH", "BAND"
+        );
         text.push_str(&format!(
-            "{:<ssid_w$}  {:<ap_w$}  {:>7}  {:>3}  {:>7}\n",
-            ssid, label, e.signal_dbm, e.channel, e.band()
+            "{:-<ssid_w$}  {:-<ap_w$}  {:->7}  {:->3}  {:-<w_w$}  {:->7}\n",
+            "", "", "-------", "---", "", "-------"
         ));
+        for e in entries {
+            let ssid = ssid_text(e);
+            let label = ap_full_label(aliases, &e.bssid);
+            text.push_str(&format!(
+                "{:<ssid_w$}  {:<ap_w$}  {:>7}  {:>3}  {:<w_w$}  {:>7}\n",
+                ssid, label, e.signal_dbm, e.channel, width_text(e), e.band()
+            ));
+        }
+        text
+    } else {
+        let mut text = format!(
+            "{:<ssid_w$}  {:<ap_w$}  {:>7}  {:>3}  {:>7}\n",
+            "SSID", "AP", "SIGNAL", "CH", "BAND"
+        );
+        text.push_str(&format!(
+            "{:-<ssid_w$}  {:-<ap_w$}  {:->7}  {:->3}  {:->7}\n",
+            "", "", "-------", "---", "-------"
+        ));
+        for e in entries {
+            let ssid = ssid_text(e);
+            let label = ap_full_label(aliases, &e.bssid);
+            text.push_str(&format!(
+                "{:<ssid_w$}  {:<ap_w$}  {:>7}  {:>3}  {:>7}\n",
+                ssid, label, e.signal_dbm, e.channel, e.band()
+            ));
+        }
+        text
     }
-    text
 }
 
 /// Text for the recorded scan list of a measurement: the measured SSID's
@@ -871,7 +1028,15 @@ fn format_scan_list_section(scan_results: &[crate::models::ScanEntry], connected
     for e in &own {
         let marker = if e.is_active { "● " } else { "  " };
         let label = ap_full_label(aliases, &e.bssid);
-        text.push_str(&format!("\n{marker}{label}  {} dBm  ch{} {}", e.signal_dbm, e.channel, e.band()));
+        let suffix = crate::models::width_center_suffix(
+            e.channel_width_mhz,
+            e.center_freq_mhz,
+            e.center_freq2_mhz,
+        );
+        text.push_str(&format!(
+            "\n{marker}{label}  {} dBm  ch{} {}{}",
+            e.signal_dbm, e.channel, e.band(), suffix
+        ));
     }
     text
 }

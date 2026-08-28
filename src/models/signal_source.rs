@@ -136,6 +136,9 @@ mod tests {
             channel: 36,
             signal_dbm: dbm,
             is_active: active,
+            channel_width_mhz: None,
+            center_freq_mhz: None,
+            center_freq2_mhz: None,
         }
     }
 

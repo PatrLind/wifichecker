@@ -263,8 +263,8 @@ mod tests {
         let mut m1 =
             Measurement::new(0.1, 0.1, "Home".to_string(), "AA:BB:CC:DD:EE:01".to_string(), 5180, 36, -55);
         m1.scan_results = vec![
-            ScanEntry { ssid: "Home".into(), bssid: "AA:BB:CC:DD:EE:01".into(), frequency_mhz: 5180, channel: 36, signal_dbm: -55, is_active: true },
-            ScanEntry { ssid: "Home".into(), bssid: "AA:BB:CC:DD:EE:02".into(), frequency_mhz: 2437, channel: 6, signal_dbm: -70, is_active: false },
+            ScanEntry { ssid: "Home".into(), bssid: "AA:BB:CC:DD:EE:01".into(), frequency_mhz: 5180, channel: 36, signal_dbm: -55, is_active: true, channel_width_mhz: None, center_freq_mhz: None, center_freq2_mhz: None },
+            ScanEntry { ssid: "Home".into(), bssid: "AA:BB:CC:DD:EE:02".into(), frequency_mhz: 2437, channel: 6, signal_dbm: -70, is_active: false, channel_width_mhz: None, center_freq_mhz: None, center_freq2_mhz: None },
         ];
         let m2 = Measurement::no_signal(0.2, 0.2);
         f.add_measurement(m1);
@@ -281,9 +281,9 @@ mod tests {
         let mut m1 =
             Measurement::new(0.1, 0.1, "Home".to_string(), "AA:BB:CC:DD:EE:01".to_string(), 5180, 36, -55);
         m1.scan_results = vec![
-            ScanEntry { ssid: "Home".into(), bssid: "AA:BB:CC:DD:EE:01".into(), frequency_mhz: 5180, channel: 36, signal_dbm: -55, is_active: true },
-            ScanEntry { ssid: "Home".into(), bssid: "AA:BB:CC:DD:EE:02".into(), frequency_mhz: 2437, channel: 6, signal_dbm: -70, is_active: false },
-            ScanEntry { ssid: "GuestNet".into(), bssid: "FF:FF:FF:FF:FF:01".into(), frequency_mhz: 2412, channel: 1, signal_dbm: -60, is_active: false },
+            ScanEntry { ssid: "Home".into(), bssid: "AA:BB:CC:DD:EE:01".into(), frequency_mhz: 5180, channel: 36, signal_dbm: -55, is_active: true, channel_width_mhz: None, center_freq_mhz: None, center_freq2_mhz: None },
+            ScanEntry { ssid: "Home".into(), bssid: "AA:BB:CC:DD:EE:02".into(), frequency_mhz: 2437, channel: 6, signal_dbm: -70, is_active: false, channel_width_mhz: None, center_freq_mhz: None, center_freq2_mhz: None },
+            ScanEntry { ssid: "GuestNet".into(), bssid: "FF:FF:FF:FF:FF:01".into(), frequency_mhz: 2412, channel: 1, signal_dbm: -60, is_active: false, channel_width_mhz: None, center_freq_mhz: None, center_freq2_mhz: None },
         ];
         // A second floor measuring a different SSID.
         let m2 = Measurement::new(0.3, 0.3, "Office".to_string(), "BB:BB:BB:BB:BB:01".to_string(), 5180, 36, -58);
@@ -312,9 +312,9 @@ mod tests {
         let mut m1 =
             Measurement::new(0.1, 0.1, "Home".to_string(), "AA:BB:CC:DD:EE:01".to_string(), 5180, 36, -55);
         m1.scan_results = vec![
-            ScanEntry { ssid: "Home".into(), bssid: "AA:BB:CC:DD:EE:01".into(), frequency_mhz: 5180, channel: 36, signal_dbm: -55, is_active: true },
-            ScanEntry { ssid: "Home".into(), bssid: "AA:BB:CC:DD:EE:02".into(), frequency_mhz: 2437, channel: 6, signal_dbm: -70, is_active: false },
-            ScanEntry { ssid: "GuestNet".into(), bssid: "FF:FF:FF:FF:FF:01".into(), frequency_mhz: 2412, channel: 1, signal_dbm: -60, is_active: false },
+            ScanEntry { ssid: "Home".into(), bssid: "AA:BB:CC:DD:EE:01".into(), frequency_mhz: 5180, channel: 36, signal_dbm: -55, is_active: true, channel_width_mhz: None, center_freq_mhz: None, center_freq2_mhz: None },
+            ScanEntry { ssid: "Home".into(), bssid: "AA:BB:CC:DD:EE:02".into(), frequency_mhz: 2437, channel: 6, signal_dbm: -70, is_active: false, channel_width_mhz: None, center_freq_mhz: None, center_freq2_mhz: None },
+            ScanEntry { ssid: "GuestNet".into(), bssid: "FF:FF:FF:FF:FF:01".into(), frequency_mhz: 2412, channel: 1, signal_dbm: -60, is_active: false, channel_width_mhz: None, center_freq_mhz: None, center_freq2_mhz: None },
         ];
         // Old measurement WITHOUT a scan list (connected AP must still show
         // up under its SSID section).
@@ -347,6 +347,9 @@ mod tests {
             channel: 36,
             signal_dbm: -60,
             is_active: false,
+            channel_width_mhz: None,
+            center_freq_mhz: None,
+            center_freq2_mhz: None,
         }];
         let m2 =
             Measurement::new(0.2, 0.2, "NewName".to_string(), "AA:BB:CC:DD:EE:01".to_string(), 5180, 36, -60);

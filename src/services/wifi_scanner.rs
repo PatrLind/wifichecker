@@ -12,6 +12,13 @@ pub struct WifiInfo {
     pub device: String,
     /// True when this AP is the one the computer is associated with.
     pub is_active: bool,
+    /// Channel width in MHz (20/40/80/160/320); 80+80 stored as 160.
+    /// Filled in via nl80211 (best effort).
+    pub channel_width_mhz: Option<u32>,
+    /// Center frequency 1 in MHz.
+    pub center_freq_mhz: Option<u32>,
+    /// Center frequency 2 in MHz (80+80 only).
+    pub center_freq2_mhz: Option<u32>,
 }
 
 pub struct WifiScanner;

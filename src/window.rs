@@ -15,6 +15,7 @@ use crate::models::{AppSettings, Floor, Measurement, Project, ScanEntry, SignalS
 use crate::persistence::{JsonStore, SettingsStore};
 use crate::persistence::json_store::{drawings_dir_for, ensure_config_dirs};
 use crate::services::{IperfClient, SmbTester, WifiInfo, WifiScanner};
+use crate::services::nl80211;
 use crate::widgets::{FloorPlanView, LegendBar, MeasurementPanel, SettingsDialog};
 use crate::widgets::floor_plan_view::DrawMode;
 use std::collections::HashMap;
@@ -421,16 +422,52 @@ fn show_new_network_confirm(
     });
 }
 
+/// Convert a runtime scan entry to a stored one.
+fn wifi_to_scan_entry(w: &WifiInfo) -> ScanEntry {
+    ScanEntry {
+        ssid: w.ssid.clone(),
+        bssid: w.bssid.clone(),
+        frequency_mhz: w.frequency_mhz,
+        channel: w.channel,
+        signal_dbm: w.signal_dbm,
+        is_active: w.is_active,
+        channel_width_mhz: w.channel_width_mhz,
+        center_freq_mhz: w.center_freq_mhz,
+        center_freq2_mhz: w.center_freq2_mhz,
+    }
+}
+
+/// Apply nl80211 scan-channel data (width/center per BSSID) to a scan list.
+fn merge_nl_scan(list: &mut [WifiInfo], scan: &nl80211::ScanChannels) {
+    for e in list.iter_mut() {
+        if let Some(c) = scan.get(&e.bssid) {
+            e.channel_width_mhz = c.width_mhz;
+            e.center_freq_mhz = c.center_freq_mhz;
+            e.center_freq2_mhz = c.center_freq2_mhz;
+        }
+    }
+}
+
 /// Show a confirm dialog when no WiFi connection is detected at the
 /// measurement point. Invokes `on_response(true)` to record a "no signal"
 /// point (marking a dead zone) and `on_response(false)` to cancel.
+/// `ap_count` is the number of networks detected in range (recorded with
+/// the point when it is non-zero).
 fn show_no_signal_confirm(
     window: &libadwaita::ApplicationWindow,
+    ap_count: usize,
     on_response: impl FnOnce(bool) + 'static,
 ) {
+    let body = if ap_count > 0 {
+        format!(
+            "No WiFi connection was detected at this point.\n{ap_count} network(s) in range — they will be recorded with this point.\n\nRecord it as a \"no signal\" point to mark this as a dead zone?"
+        )
+    } else {
+        "No WiFi connection was detected at this point.\n\nRecord it as a \"no signal\" point to mark this as a dead zone?".to_string()
+    };
     let dialog = libadwaita::MessageDialog::builder()
         .heading("No WiFi connection")
-        .body("No WiFi connection was detected at this point.\n\nRecord it as a \"no signal\" point to mark this as a dead zone?")
+        .body(&body)
         .default_response("cancel")
         .close_response("cancel")
         .transient_for(window)
@@ -445,17 +482,26 @@ fn show_no_signal_confirm(
 }
 
 /// Record a "no signal" measurement at a position and update the UI.
+/// `scan_list` is the (possibly empty) list of networks detected in range
+/// at the point — stored with the measurement.
 fn record_no_signal_point(
     rx: f64,
     ry: f64,
+    scan_list: &[WifiInfo],
     state: &Rc<RefCell<AppState>>,
     fp: &FloorPlanView,
     legend: &LegendBar,
     panel: &MeasurementPanel,
     overlay: &ToastOverlay,
 ) {
-    let m = Measurement::no_signal(rx, ry);
+    let mut m = Measurement::no_signal(rx, ry);
+    m.scan_results = scan_list
+        .iter()
+        .take(MAX_SCAN_RESULTS)
+        .map(wifi_to_scan_entry)
+        .collect();
     let new_id = m.id.clone();
+    let n_aps = m.scan_results.len();
     let (measurements, panel_measurements) = {
         let mut s = state.borrow_mut();
         let idx = s.current_floor;
@@ -474,7 +520,12 @@ fn record_no_signal_point(
     legend.set_selected_measurement(measurements.iter().find(|mm| mm.id == new_id).cloned());
     panel.set_selected_by_id(Some(new_id.clone()));
     auto_save(fp, state);
-    overlay.add_toast(Toast::new("Recorded \"no signal\" point"));
+    let toast = if n_aps == 0 {
+        "Recorded \"no signal\" point".to_string()
+    } else {
+        format!("Recorded \"no signal\" point ({n_aps} APs in range)")
+    };
+    overlay.add_toast(Toast::new(&toast));
 }
 
 /// Load a floor's data (image, canvas, calibration, measurements) into the
@@ -1050,15 +1101,44 @@ fn build_ui(
             let (tx, recv) = async_channel::bounded::<MeasureResult>(1);
             std::thread::spawn(move || {
                 let cards = WifiScanner::scan_all().unwrap_or_default();
-                let wifi = pick_card_index(&preferred_device, &cards).and_then(|i| cards.get(i).cloned());
+                let mut wifi = pick_card_index(&preferred_device, &cards).and_then(|i| cards.get(i).cloned());
 
                 // Fresh scan list for the measured card (all APs in range,
                 // strongest first). Requests a new scan and waits up to ~6 s
                 // for it; falls back to the cached list on failure.
-                let scan_list = wifi
+                //
+                // Without an active connection we still scan (on the
+                // preferred card if available, else the first WiFi card),
+                // so a "no signal" point can record which networks were in
+                // range.
+                let mut scan_list: Vec<WifiInfo> = if let Some(w) = &wifi {
+                    WifiScanner::scan_list(Some(&w.device)).unwrap_or_default()
+                } else {
+                    let devs = crate::services::nm_dbus::query_wifi_device_names();
+                    let dev = devs
+                        .iter()
+                        .find(|d| preferred_device.as_deref() == Some(d.as_str()))
+                        .or_else(|| devs.first());
+                    dev.map(|d| WifiScanner::scan_list(Some(d)).unwrap_or_default())
+                        .unwrap_or_default()
+                };
+
+                // Channel width + center frequency via native netlink
+                // (best effort — unavailable data simply stays unknown).
+                let nl_device = wifi
                     .as_ref()
-                    .map(|w| WifiScanner::scan_list(Some(&w.device)).unwrap_or_default())
-                    .unwrap_or_default();
+                    .map(|w| w.device.clone())
+                    .or_else(|| scan_list.first().map(|e| e.device.clone()));
+                if let Some(dev) = nl_device {
+                    if let Some(ic) = nl80211::interface_channel(&dev) {
+                        if let Some(w) = wifi.as_mut() {
+                            w.channel_width_mhz = ic.channel.width_mhz;
+                            w.center_freq_mhz = ic.channel.center_freq_mhz;
+                            w.center_freq2_mhz = ic.channel.center_freq2_mhz;
+                        }
+                        merge_nl_scan(&mut scan_list, &nl80211::scan_channels(ic.ifindex));
+                    }
+                }
 
                 let (iperf_mbps, iperf_error) = if iperf_enabled && !iperf_server.is_empty() {
                     match IperfClient::new(&iperf_server, iperf_port, iperf_dur, iperf_streams).run_test() {
@@ -1112,15 +1192,18 @@ fn build_ui(
                         overlay2.add_toast(Toast::new(&format!("Samba error: {e}")));
                     }
                     // Offer to record this point as "no signal" (WiFi off / not
-                    // connected) so the user can mark dead zones.
+                    // connected) so the user can mark dead zones. The scan list
+                    // (networks in range) is recorded with the point.
                     let state3 = state2.clone();
                     let fp3 = fp2.clone();
                     let legend3 = legend2.clone();
                     let panel4 = panel3.clone();
                     let overlay3 = overlay2.clone();
-                    show_no_signal_confirm(&window2, move |ok| {
+                    let scan_list = result.scan_list;
+                    let n_aps = scan_list.len();
+                    show_no_signal_confirm(&window2, n_aps, move |ok| {
                         if ok {
-                            record_no_signal_point(rx, ry, &state3, &fp3, &legend3, &panel4, &overlay3);
+                            record_no_signal_point(rx, ry, &scan_list, &state3, &fp3, &legend3, &panel4, &overlay3);
                         }
                     });
                     *measuring2.borrow_mut() = false;
@@ -1138,15 +1221,12 @@ fn build_ui(
                     .scan_list
                     .iter()
                     .take(MAX_SCAN_RESULTS)
-                    .map(|w| ScanEntry {
-                        ssid: w.ssid.clone(),
-                        bssid: w.bssid.clone(),
-                        frequency_mhz: w.frequency_mhz,
-                        channel: w.channel,
-                        signal_dbm: w.signal_dbm,
-                        is_active: w.is_active,
-                    })
+                    .map(wifi_to_scan_entry)
                     .collect();
+                m.channel_width_mhz = info.channel_width_mhz;
+                m.center_freq_mhz = info.center_freq_mhz;
+                m.center_freq2_mhz = info.center_freq2_mhz;
+                m.device = Some(info.device.clone());
                 m.iperf_mbps = result.iperf_mbps;
                 m.smb_mbps = result.smb_mbps;
                 let new_id = m.id.clone();
@@ -1184,6 +1264,7 @@ fn build_ui(
                     &info.ssid, &info.bssid,
                     info.signal_dbm, info.frequency_mhz, info.channel,
                     &info.device,
+                    info.channel_width_mhz, info.center_freq_mhz, info.center_freq2_mhz,
                     result.iperf_mbps, result.smb_mbps, unit,
                     Some(&result.scan_list),
                 );
@@ -1391,38 +1472,50 @@ fn build_ui(
                 std::thread::spawn(move || {
                     let cards = WifiScanner::scan_all().unwrap_or_default();
                     let chosen = pick_card_index(&pt, &cards);
-                    let info = chosen.and_then(|i| cards.get(i).cloned());
+                    let mut info = chosen.and_then(|i| cards.get(i).cloned());
                     // AP list for the measured card: re-read the cached scan
                     // list only when NM completed a new scan since the last
                     // tick (LastScan counter advanced), or when the card changed.
-                    let list = match info.as_ref() {
-                        Some(w) => {
-                            let dev = w.device.clone();
-                            let (cdev, prev_ls) = {
-                                let c = scan_cache.lock().unwrap();
-                                (c.0.clone(), c.1)
-                            };
-                            if dev != cdev {
-                                // Card switched — force a fresh read.
-                                match WifiScanner::scan_list_if_newer(Some(&dev), 0) {
-                                    Ok(Some((ls, new_list))) => {
-                                        *scan_cache.lock().unwrap() = (dev, ls, new_list.clone());
-                                        new_list
-                                    }
-                                    _ => Vec::new(),
-                                }
-                            } else {
-                                match WifiScanner::scan_list_if_newer(Some(&dev), prev_ls) {
-                                    Ok(Some((ls, new_list))) => {
-                                        *scan_cache.lock().unwrap() = (dev, ls, new_list.clone());
-                                        new_list
-                                    }
-                                    _ => scan_cache.lock().unwrap().2.clone(),
-                                }
+                    let mut list: Vec<WifiInfo> = Vec::new();
+                    let mut list_refreshed = false;
+                    if let Some(w) = info.as_ref() {
+                        let dev = w.device.clone();
+                        let (cdev, prev_ls) = {
+                            let c = scan_cache.lock().unwrap();
+                            (c.0.clone(), c.1)
+                        };
+                        if dev != cdev {
+                            // Card switched — force a fresh read.
+                            if let Ok(Some((ls, new_list))) = WifiScanner::scan_list_if_newer(Some(&dev), 0) {
+                                *scan_cache.lock().unwrap() = (dev, ls, new_list.clone());
+                                list = new_list;
+                                list_refreshed = true;
+                            }
+                        } else if let Ok(Some((ls, new_list))) = WifiScanner::scan_list_if_newer(Some(&dev), prev_ls) {
+                            *scan_cache.lock().unwrap() = (dev, ls, new_list.clone());
+                            list = new_list;
+                            list_refreshed = true;
+                        } else {
+                            list = scan_cache.lock().unwrap().2.clone();
+                        }
+                    }
+                    // Channel width + center frequency (best effort, native
+                    // netlink): the active AP from the interface query (every
+                    // tick), the list entries from the scan cache (only when
+                    // the list was refreshed).
+                    if let Some(w) = info.as_ref() {
+                        if let Some(ic) = nl80211::interface_channel(&w.device) {
+                            info = Some(WifiInfo {
+                                channel_width_mhz: ic.channel.width_mhz,
+                                center_freq_mhz: ic.channel.center_freq_mhz,
+                                center_freq2_mhz: ic.channel.center_freq2_mhz,
+                                ..w.clone()
+                            });
+                            if list_refreshed {
+                                merge_nl_scan(&mut list, &nl80211::scan_channels(ic.ifindex));
                             }
                         }
-                        None => Vec::new(),
-                    };
+                    }
                     let _ = tx.send_blocking((cards, info, list));
                 });
             }
@@ -1430,7 +1523,8 @@ fn build_ui(
                 let Ok((cards, info, list)) = rx.recv().await else { return };
                 match info {
                     Some(w) => {
-                        p.refresh_live_signal(&w.ssid, &w.bssid, w.signal_dbm, w.frequency_mhz, w.channel, &w.device, Some(&list));
+                        p.refresh_live_signal(&w.ssid, &w.bssid, w.signal_dbm, w.frequency_mhz, w.channel, &w.device,
+                            w.channel_width_mhz, w.center_freq_mhz, w.center_freq2_mhz, Some(&list));
                         // Legend pointer value follows the active signal source.
                         let legend_dbm = match &source {
                             SignalSource::ConnectedAp => Some(w.signal_dbm as f64),

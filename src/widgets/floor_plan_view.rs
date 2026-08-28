@@ -1172,27 +1172,63 @@ fn draw_measurement_cells(
 ) {
     let px_step = grid_px_step(scale_px_per_m, spacing_m);
     let (ox, oy) = origin.unwrap_or((0.0, 0.0));
+    // The SSIDs this floor is measuring (its regular, connected
+    // measurements) — "the wanted networks", used to resolve the generic
+    // SSID source at no-signal points.
+    let wanted_ssids: Vec<String> = measurements
+        .iter()
+        .filter(|m| !m.no_signal && !m.ssid.is_empty())
+        .map(|m| m.ssid.clone())
+        .collect();
     ctx.save().unwrap();
     for m in measurements {
         let px = m.x * w;
         let py = m.y * h;
         // The measurement is stored at cell center; find its cell (anchored to the origin).
         let (cell_x, cell_y) = cell_anchor(px, py, px_step, (ox, oy));
-        // A no-signal point is "no data" — a neutral gray, not the worst
-        // (red) colour on the scale. Regular samples use the metric colour;
-        // a missing value (e.g. the chosen BSSID not in range) is left
-        // uncolored.
+        // A no-signal point is "no connection", not necessarily "no data":
+        // if a wanted AP was detected at that point, colour it by that AP's
+        // signal (signal metric only). Otherwise it gets a neutral gray box
+        // with a blue cross so it stays visible against any map background.
+        // Regular samples use the metric colour; a point with no value for
+        // the current selection (e.g. the chosen BSSID not in range, or no
+        // throughput reading) is shown the same way — gray + cross — rather
+        // than disappearing.
+        let mut gray_cross = false;
         let (r, g, b) = if m.no_signal {
-            (0.5, 0.5, 0.5)
+            let val = (metric == ColorMetric::SignalDbm)
+                .then(|| crate::models::color_metric::no_signal_metric_value(m, signal_source, &wanted_ssids))
+                .flatten();
+            match val {
+                Some(v) => value_color(v, min, max),
+                None => {
+                    gray_cross = true;
+                    (0.5, 0.5, 0.5)
+                }
+            }
         } else {
             match metric_value(m, metric, signal_source) {
                 Some(v) => value_color(v, min, max),
-                None => continue,
+                None => {
+                    gray_cross = true;
+                    (0.5, 0.5, 0.5)
+                }
             }
         };
         ctx.set_source_rgba(r, g, b, 0.72);
         ctx.rectangle(cell_x, cell_y, px_step, px_step);
         ctx.fill().unwrap();
+        if gray_cross {
+            // Bright blue X on top of the gray box (visibility on busy maps).
+            ctx.set_source_rgba(0.30, 0.65, 1.0, 1.0);
+            ctx.set_line_width(2.0);
+            let ix = 0.18 * px_step;
+            ctx.move_to(cell_x + ix, cell_y + ix);
+            ctx.line_to(cell_x + px_step - ix, cell_y + px_step - ix);
+            ctx.move_to(cell_x + px_step - ix, cell_y + ix);
+            ctx.line_to(cell_x + ix, cell_y + px_step - ix);
+            ctx.stroke().unwrap();
+        }
         // Subtle darker border so adjacent cells are distinguishable
         ctx.set_source_rgba(0.0, 0.0, 0.0, 0.25);
         ctx.set_line_width(0.8);

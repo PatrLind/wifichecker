@@ -151,10 +151,50 @@ pub fn query_active_wifi_devices() -> Result<Vec<WifiInfo>> {
             link_speed_mbps,
             device: device_name,
             is_active: true,
+            channel_width_mhz: None,
+            center_freq_mhz: None,
+            center_freq2_mhz: None,
         });
     }
 
     Ok(result)
+}
+
+/// Query the interface names (e.g. "wlan0") of all NM-managed WiFi devices,
+/// connected or not. Used to pick a card for scans when there is no active
+/// connection ("no signal" points) and for nl80211 enrichment.
+///
+/// Returns an empty list on any error (best effort).
+pub fn query_wifi_device_names() -> Vec<String> {
+    let Ok(conn) = Connection::system() else {
+        return Vec::new();
+    };
+    let Ok(nm) = NetworkManagerProxyBlocking::new(&conn) else {
+        return Vec::new();
+    };
+    let Ok(devices) = nm.get_all_devices() else {
+        return Vec::new();
+    };
+    let mut result = Vec::new();
+    for device_path in devices {
+        let device = match NMDeviceProxyBlocking::builder(&conn)
+            .path(device_path.as_str())
+            .ok()
+            .and_then(|b| b.build().ok())
+        {
+            Some(d) => d,
+            None => continue,
+        };
+        if device.device_type().ok() != Some(DEVICE_TYPE_WIFI) {
+            continue;
+        }
+        if let Ok(name) = device.interface() {
+            if !name.is_empty() {
+                result.push(name);
+            }
+        }
+    }
+    result
 }
 
 /// Query the active WiFi access point (the first active WiFi card). Kept for
@@ -190,6 +230,9 @@ fn read_ap(conn: &Connection, path: &OwnedObjectPath) -> Option<WifiInfo> {
         link_speed_mbps,
         device: String::new(),
         is_active: false,
+        channel_width_mhz: None,
+        center_freq_mhz: None,
+        center_freq2_mhz: None,
     })
 }
 
