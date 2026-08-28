@@ -190,6 +190,17 @@ trigger code, the `setcap` dialog, and the related `MeasureResult` flags.
   via `rebuild_project_menu` (same `gio::Menu` object, so the
   MenuButton picks up changes without re-setting the model).
 
+## Part 2d: theme-aware channel charts (2026-08-28)
+
+The charts previously painted a hard-coded white background with dark
+text/lines — fine in light mode, glaring in dark mode. Now every chart
+color resolves from the active theme via the widget's style context
+(`view_bg_color` / `view_fg_color`, verified live against libadwaita
+1.x in both schemes): background, grid lines, axis labels, plot frame,
+bar outlines, hover banner, spotlight outline and the channel marker
+triangle all follow the theme (verified names resolve in both light
+and dark; safe light-theme fallbacks if a token is missing).
+
 ## Risks / open items
 ## Part 2c: remembered UI + last/recent projects (2026-08-28)
 
@@ -205,6 +216,17 @@ trigger code, the `setcap` dialog, and the related `MeasureResult` flags.
   save-as/open-recent via `remember_project_path`; menu rebuilt in place
   via `rebuild_project_menu` (same `gio::Menu` object, so the
   MenuButton picks up changes without re-setting the model).
+
+## Part 2d: theme-aware channel charts (2026-08-28)
+
+The charts previously painted a hard-coded white background with dark
+text/lines — fine in light mode, glaring in dark mode. Now every chart
+color resolves from the active theme via the widget's style context
+(`view_bg_color` / `view_fg_color`, verified live against libadwaita
+1.x in both schemes): background, grid lines, axis labels, plot frame,
+bar outlines, hover banner, spotlight outline and the channel marker
+triangle all follow the theme (verified names resolve in both light
+and dark; safe light-theme fallbacks if a token is missing).
 
 ## Risks / open items
 

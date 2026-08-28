@@ -354,12 +354,35 @@ pub type HoverKey = (u8, String);
 
 /// Draw a channel chart. `hovered` is the highlighted AP (if any). Returns
 /// the screen-space bar rects (in draw order) for hover hit-testing.
+/// Colors resolved from the active theme so the chart stays readable in
+/// both light and dark mode.
+struct ChartTheme {
+    bg: (f64, f64, f64),
+    fg: (f64, f64, f64),
+}
+
+/// Resolve the theme's view background/foreground colors (with safe
+/// light-theme fallbacks) from the widget's style context.
+fn chart_theme(widget: &gtk4::Widget) -> ChartTheme {
+    let sc = widget.style_context();
+    let rgb = |name: &str, fb: (f64, f64, f64)| -> (f64, f64, f64) {
+        sc.lookup_color(name)
+            .map(|c| (c.red() as f64, c.green() as f64, c.blue() as f64))
+            .unwrap_or(fb)
+    };
+    ChartTheme {
+        bg: rgb("view_bg_color", (1.0, 1.0, 1.0)),
+        fg: rgb("view_fg_color", (0.0, 0.0, 0.0)),
+    }
+}
+
 fn draw_channel_chart(
     ctx: &Context,
     width: f64,
     height: f64,
     data: &ChartData,
     hovered: Option<HoverKey>,
+    theme: &ChartTheme,
 ) -> Vec<BarRect> {
     let pad_l = 40.0;
     let pad_r = 8.0;
@@ -374,8 +397,8 @@ fn draw_channel_chart(
         pad_t + ((DBM_TOP - d) / (DBM_TOP - DBM_BOTTOM)) * plot_h
     };
 
-    // Background.
-    ctx.set_source_rgb(1.0, 1.0, 1.0);
+    // Background (theme-aware: white in light mode, dark in dark mode).
+    ctx.set_source_rgb(theme.bg.0, theme.bg.1, theme.bg.2);
     ctx.rectangle(0.0, 0.0, width, height);
     ctx.fill().unwrap();
 
@@ -389,7 +412,7 @@ fn draw_channel_chart(
             if !covered {
                 let x0 = x_of(f - data.free_strip_mhz / 2.0);
                 let x1 = x_of(f + data.free_strip_mhz / 2.0);
-                ctx.set_source_rgba(0.30, 0.75, 0.30, 0.16);
+                ctx.set_source_rgba(0.30, 0.75, 0.30, 0.20);
                 ctx.rectangle(x0, pad_t, x1 - x0, plot_h);
                 ctx.fill().unwrap();
             }
@@ -400,12 +423,12 @@ fn draw_channel_chart(
     let mut g = DBM_BOTTOM;
     while g <= DBM_TOP + 1e-9 {
         let y = y_of(g);
-        ctx.set_source_rgba(0.0, 0.0, 0.0, 0.08);
+        ctx.set_source_rgba(theme.fg.0, theme.fg.1, theme.fg.2, 0.08);
         ctx.set_line_width(1.0);
         ctx.move_to(pad_l, y);
         ctx.line_to(pad_l + plot_w, y);
         ctx.stroke().unwrap();
-        ctx.set_source_rgb(0.3, 0.3, 0.3);
+        ctx.set_source_rgba(theme.fg.0, theme.fg.1, theme.fg.2, 0.75);
         ctx.set_font_size(9.0);
         let label = format!("{}", g as i32);
         let tw = ctx.text_extents(&label).map(|t| t.width()).unwrap_or(0.0);
@@ -417,7 +440,7 @@ fn draw_channel_chart(
     // X tick labels: channel numbers at their center frequencies.
     let n = data.ticks.len().max(1);
     let step = (((n as f64) * 26.0 / plot_w).ceil() as usize).max(1);
-    ctx.set_source_rgb(0.3, 0.3, 0.3);
+    ctx.set_source_rgba(theme.fg.0, theme.fg.1, theme.fg.2, 0.75);
     for (_i, (f, ch)) in data.ticks.iter().enumerate().step_by(step) {
         let x = x_of(*f);
         ctx.set_line_width(1.0);
@@ -456,12 +479,12 @@ fn draw_channel_chart(
         ctx.rectangle(x0, ytop, bw, bottom - ytop);
         ctx.fill().unwrap();
         if hot {
-            // Black outline so the highlighted bar stands out from the
-            // dimmed bars behind/in front of it.
-            ctx.set_source_rgb(0.03, 0.03, 0.03);
+            // Full-strength theme outline so the highlighted bar stands
+            // out from the dimmed bars behind/in front of it.
+            ctx.set_source_rgb(theme.fg.0, theme.fg.1, theme.fg.2);
             ctx.set_line_width(2.5);
         } else {
-            ctx.set_source_rgba(0.0, 0.0, 0.0, 0.22);
+            ctx.set_source_rgba(theme.fg.0, theme.fg.1, theme.fg.2, 0.25);
             ctx.set_line_width(1.0);
         }
         ctx.rectangle(x0, ytop, bw, bottom - ytop);
@@ -486,33 +509,29 @@ fn draw_channel_chart(
             let bw = tw + 12.0;
             let bx = (pad_l + plot_w / 2.0 - bw / 2.0).clamp(pad_l, (pad_l + plot_w - bw).max(pad_l));
             let by = pad_t + 2.0;
-            ctx.set_source_rgba(1.0, 1.0, 1.0, 0.92);
+            ctx.set_source_rgba(theme.fg.0, theme.fg.1, theme.fg.2, 0.08);
             ctx.rectangle(bx, by, bw, th + 6.0);
             ctx.fill().unwrap();
-            ctx.set_source_rgba(0.0, 0.0, 0.0, 0.4);
-            ctx.set_line_width(1.0);
-            ctx.rectangle(bx, by, bw, th + 6.0);
-            ctx.stroke().unwrap();
-            ctx.set_source_rgb(0.1, 0.1, 0.1);
+            ctx.set_source_rgb(theme.fg.0, theme.fg.1, theme.fg.2);
             ctx.move_to(bx + 6.0, by + th + 2.0);
             let _ = ctx.show_text(&r.info);
         }
     }
 
     // Plot frame.
-    ctx.set_source_rgba(0.0, 0.0, 0.0, 0.25);
+    ctx.set_source_rgba(theme.fg.0, theme.fg.1, theme.fg.2, 0.30);
     ctx.set_line_width(1.0);
     ctx.rectangle(pad_l, pad_t, plot_w, plot_h);
     ctx.stroke().unwrap();
 
-    // Channel marker: a small black triangle at the bottom of the plot,
-    // pointing up at the highlighted bar. Drawn last so it is always on
-    // top of the (dimmed) bars and the frame.
+    // Channel marker: a small theme-colored triangle at the bottom of the
+    // plot, pointing up at the highlighted bar. Drawn last so it is always
+    // on top of the (dimmed) bars and the frame.
     if let Some(key) = &hovered {
         if let Some(r) = rects.iter().find(|r| &r.key == key) {
             let cx = (r.x0 + r.x1) / 2.0;
             let yb = pad_t + plot_h;
-            ctx.set_source_rgb(0.03, 0.03, 0.03);
+            ctx.set_source_rgb(theme.fg.0, theme.fg.1, theme.fg.2);
             ctx.move_to(cx - 6.0, yb + 1.0);
             ctx.line_to(cx + 6.0, yb + 1.0);
             ctx.line_to(cx, yb - 11.0);
@@ -1099,8 +1118,9 @@ fn append_chart(content: &gtk4::Box, chart: ChartData, sync: &BandSync) {
     let rects: Rc<RefCell<Vec<BarRect>>> = Rc::new(RefCell::new(Vec::new()));
     sync.areas.borrow_mut().push(area.clone());
     let (rects_draw, hover_draw) = (Rc::clone(&rects), Rc::clone(&sync.hover));
-    area.set_draw_func(move |_area, ctx, w, h| {
-        let r = draw_channel_chart(ctx, w as f64, h as f64, &chart, hover_draw.borrow().clone());
+    area.set_draw_func(move |area, ctx, w, h| {
+        let theme = chart_theme(area.upcast_ref());
+        let r = draw_channel_chart(ctx, w as f64, h as f64, &chart, hover_draw.borrow().clone(), &theme);
         *rects_draw.borrow_mut() = r;
     });
     let motion = gtk4::EventControllerMotion::new();

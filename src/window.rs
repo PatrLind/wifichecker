@@ -82,6 +82,10 @@ impl Window {
             })
         };
 
+        // Title reflects the file that is open (e.g. "Alpha.json" → "Alpha").
+        let mut project = project;
+        adopt_project_name_from_file(&mut project, &project_path);
+
         window.set_title(Some(&format!("{} — WiFi Checker", project.name)));
 
         let state = Rc::new(RefCell::new(AppState {
@@ -157,7 +161,11 @@ fn save_ui_geometry_now<W: gtk4::prelude::IsA<gtk4::Window>>(
         return;
     }
     let sidebar = (w - body.position()).clamp(180, 700);
-    let mut s = settings.borrow_mut();
+    // Never panic from a signal handler: if the settings are momentarily
+    // busy (re-entrant destroy during a live handler), skip the save —
+    // the debounced saves during the session have already persisted the
+    // geometry.
+    let Ok(mut s) = settings.try_borrow_mut() else { return };
     s.window_width = w;
     s.window_height = h;
     s.sidebar_width = sidebar;
@@ -397,11 +405,17 @@ fn add_known_ap_row(
 /// Notify the open Channel Report window about a measurement selection
 /// change (the window stores a `"channel-report-select"` callback).
 fn notify_channel_report(report_ref: &Rc<RefCell<Option<gtk4::Window>>>, id: Option<String>) {
-    if let Some(w) = report_ref.borrow().as_ref() {
-        if let Some(cb) = unsafe { w.data::<Rc<dyn Fn(Option<String>)>>("channel-report-select") } {
-            let f = unsafe { cb.as_ref() };
-            f(id);
-        }
+    // Clone the callback out of the cell first: the selection callback
+    // updates the main window's UI, so no borrow of the cell may be live
+    // while it runs.
+    let cb = {
+        let b = report_ref.borrow();
+        b.as_ref()
+            .and_then(|w| unsafe { w.data::<Rc<dyn Fn(Option<String>)>>("channel-report-select") })
+            .map(|p| unsafe { p.as_ref().clone() })
+    };
+    if let Some(f) = cb {
+        f(id);
     }
 }
 
@@ -683,6 +697,33 @@ fn remember_project_path(path: &std::path::Path, settings: &Rc<RefCell<AppSettin
     let _ = SettingsStore::save(&s);
 }
 
+/// True when `path` is the default project file (~/.config/wifichecker/…).
+fn is_default_project_path(path: &std::path::Path) -> bool {
+    let default = JsonStore::default_path();
+    if path == &default {
+        return true;
+    }
+    match (path.canonicalize(), default.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Adopt the file's name as the project name ("Alpha.json" → "Alpha"), so
+/// the window title always shows which file is open. The name is persisted
+/// with the project on the next save. The default project file keeps its
+/// stored name (its file name isn't a meaningful project name).
+fn adopt_project_name_from_file(project: &mut Project, path: &std::path::Path) {
+    if is_default_project_path(path) {
+        return;
+    }
+    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+        if !stem.trim().is_empty() {
+            project.name = stem.to_string();
+        }
+    }
+}
+
 /// (Re)build the project menu: the base actions plus a "Recent Projects"
 /// section from the settings (most recent first, file names only).
 fn rebuild_project_menu(menu: &gtk4::gio::Menu, settings: &Rc<RefCell<AppSettings>>) {
@@ -724,6 +765,7 @@ fn apply_project(
     if project.floors.is_empty() {
         project.add_floor(Floor::new("Floor 1"));
     }
+    adopt_project_name_from_file(&mut project, &project_path);
     // Make sure the project's drawing files travel with the project file
     let project = independent_project_copy(&project, &drawings_dir_for(&project_path));
 
@@ -2209,10 +2251,26 @@ fn build_ui(
                 on_select,
             );
             let rr = report_ref.clone();
+            // Take the old window out of the cell first, and swap in the
+            // new one while no borrow of the cell is live: dropping the
+            // old window's last reference destroys it synchronously, and
+            // its destroy handler borrows the cell — that must not happen
+            // while this assignment still holds the borrow.
+            let old = report_ref.borrow_mut().take();
             *report_ref.borrow_mut() = Some(win.clone());
+            let weak = win.downgrade();
             win.connect_destroy(move |_| {
-                rr.borrow_mut().take();
+                // Only clear the cell if it still points at *this* window
+                // (compare via weak refs), so a stale destroy of an older
+                // window can't steal a newer window's reference.
+                let current = rr.borrow().as_ref().and_then(|c| c.downgrade().upgrade());
+                if current == weak.upgrade() {
+                    rr.borrow_mut().take();
+                }
             });
+            // Drop the previous report window's reference now, outside of
+            // any borrow of the cell (see above).
+            drop(old);
         });
     }
 
@@ -2411,6 +2469,7 @@ fn build_ui(
                 let project_menu3 = project_menu2.clone();
                 let overlay2 = overlay_ref.clone();
                 let dialog_parent = window_ref2.clone();
+                let window_ref3 = window_ref2.clone();
                 dialog.save(Some(&dialog_parent), gtk4::gio::Cancellable::NONE, move |result| {
                     let Ok(file) = result else { return; };
                     let Some(mut path) = file.path() else { return; };
@@ -2427,11 +2486,17 @@ fn build_ui(
 
                     match JsonStore::save(&project, &path) {
                         Ok(()) => {
-                            // From now on auto-save goes to the new location
-                            state2.borrow_mut().project_path = path.clone();
+                            // From now on auto-save goes to the new location,
+                            // and the project takes the new file's name.
+                            let mut s = state2.borrow_mut();
+                            s.project_path = path.clone();
+                            adopt_project_name_from_file(&mut s.project, &path);
+                            let name = s.project.name.clone();
+                            drop(s);
                             auto_save(&fp2, &state2);
                             remember_project_path(&path, &settings2);
                             rebuild_project_menu(&project_menu3, &settings2);
+                            window_ref3.set_title(Some(&format!("{name} — WiFi Checker")));
                             overlay2.add_toast(Toast::new(&format!("Project saved to {}", path.display())));
                         }
                         Err(e) => {
@@ -2640,5 +2705,18 @@ mod tests {
         assert_eq!(out.floors[0].drawing_path, project.floors[0].drawing_path);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_adopt_project_name_from_file() {
+        // A regular file adopts its stem as the project name.
+        let mut p = Project::new("My Project");
+        adopt_project_name_from_file(&mut p, std::path::Path::new("/home/x/projects/Alpha.json"));
+        assert_eq!(p.name, "Alpha");
+
+        // Dot-file names keep their stem as-is (pathological, but stable).
+        let mut p = Project::new("My Project");
+        adopt_project_name_from_file(&mut p, std::path::Path::new("/home/x/.json"));
+        assert_eq!(p.name, ".json");
     }
 }
