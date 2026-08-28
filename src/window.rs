@@ -53,15 +53,41 @@ impl Window {
         let _ = ensure_config_dirs();
         let settings = Rc::new(RefCell::new(SettingsStore::load()));
 
-        let project = JsonStore::load(&JsonStore::default_path())
-            .unwrap_or_else(|_| Project::new("My Project"));
+        // Restore the remembered window size (if it was saved).
+        {
+            let s = settings.borrow();
+            if s.window_width >= 400 && s.window_height >= 300 {
+                window.set_default_size(s.window_width, s.window_height);
+            }
+        }
+
+        // Restore the last opened project (fall back to the default project
+        // file when none was remembered or the file can't be read).
+        let (project, project_path) = {
+            let last = settings.borrow().last_project_path.clone();
+            let mut restored = None;
+            if let Some(p) = last {
+                let pb = std::path::PathBuf::from(p);
+                match JsonStore::load(&pb) {
+                    Ok(proj) => restored = Some((proj, pb)),
+                    Err(e) => log::warn!("Could not restore last project {pb:?} ({e}); using the default project"),
+                }
+            }
+            restored.unwrap_or_else(|| {
+                let default = JsonStore::default_path();
+                (
+                    JsonStore::load(&default).unwrap_or_else(|_| Project::new("My Project")),
+                    default,
+                )
+            })
+        };
 
         window.set_title(Some(&format!("{} — WiFi Checker", project.name)));
 
         let state = Rc::new(RefCell::new(AppState {
             project,
             current_floor: 0,
-            project_path: JsonStore::default_path(),
+            project_path,
         }));
 
         let content = build_ui(&window, state.clone(), settings.clone());
@@ -118,6 +144,43 @@ fn auto_save(fp: &FloorPlanView, state: &Rc<RefCell<AppState>>) {
     }
     let project = state.borrow().project.clone();
     let _ = JsonStore::save(&project, &project_path);
+}
+
+/// Save the current window size + sidebar width to the settings store
+/// (no-op when the window is unrealistically small, e.g. mid-restore).
+fn save_ui_geometry_now<W: gtk4::prelude::IsA<gtk4::Window>>(
+    window: &W, body: &gtk4::Paned, settings: &Rc<RefCell<AppSettings>>,
+) {
+    let window = window.upcast_ref::<gtk4::Window>();
+    let (w, h) = (window.width(), window.height());
+    if w < 400 || h < 300 {
+        return;
+    }
+    let sidebar = (w - body.position()).clamp(180, 700);
+    let mut s = settings.borrow_mut();
+    s.window_width = w;
+    s.window_height = h;
+    s.sidebar_width = sidebar;
+    let _ = SettingsStore::save(&s);
+}
+
+/// Debounced version of [`save_ui_geometry_now`]: coalesces the burst of
+/// resize/position notifications during a drag into one save ~400 ms later.
+///
+/// A pending timer is never *removed* (only replaced): once a timer fires
+/// its `SourceId` is dead, and calling `remove()` on it would panic inside
+/// the GTK signal handler. A stale pending timer simply fires a redundant
+/// (harmless) save within 400 ms.
+fn remember_ui_geometry<W: gtk4::prelude::IsA<gtk4::Window>>(
+    window: &W, body: &gtk4::Paned, settings: Rc<RefCell<AppSettings>>,
+    sched: Rc<RefCell<Option<glib::SourceId>>>,
+) {
+    let (window, body, settings) = (window.clone(), body.clone(), settings.clone());
+    let id = glib::timeout_add_local(std::time::Duration::from_millis(400), move || {
+        save_ui_geometry_now(&window, &body, &settings);
+        glib::ControlFlow::Break
+    });
+    sched.borrow_mut().replace(id);
 }
 
 /// "Known APs" dialog: lists every BSSID seen in this project's measurements
@@ -331,6 +394,17 @@ fn add_known_ap_row(
     rows.borrow_mut().push((bssid.to_string(), entry.clone()));
 }
 
+/// Notify the open Channel Report window about a measurement selection
+/// change (the window stores a `"channel-report-select"` callback).
+fn notify_channel_report(report_ref: &Rc<RefCell<Option<gtk4::Window>>>, id: Option<String>) {
+    if let Some(w) = report_ref.borrow().as_ref() {
+        if let Some(cb) = unsafe { w.data::<Rc<dyn Fn(Option<String>)>>("channel-report-select") } {
+            let f = unsafe { cb.as_ref() };
+            f(id);
+        }
+    }
+}
+
 /// Look up a measurement by id in the current floor (used to feed the
 /// legend's selection pointer with the selected sample).
 fn find_measurement(state: &Rc<RefCell<AppState>>, id: &str) -> Option<Measurement> {
@@ -438,9 +512,13 @@ fn wifi_to_scan_entry(w: &WifiInfo) -> ScanEntry {
 }
 
 /// Apply nl80211 scan-channel data (width/center per BSSID) to a scan list.
+///
+/// BSSIDs are matched case-insensitively: NM reports them uppercase
+/// ("B4:FB:…"), netlink keys are lowercase ("b4:fb:…").
 fn merge_nl_scan(list: &mut [WifiInfo], scan: &nl80211::ScanChannels) {
     for e in list.iter_mut() {
-        if let Some(c) = scan.get(&e.bssid) {
+        let key = e.bssid.to_ascii_lowercase();
+        if let Some(c) = scan.get(&key) {
             e.channel_width_mhz = c.width_mhz;
             e.center_freq_mhz = c.center_freq_mhz;
             e.center_freq2_mhz = c.center_freq2_mhz;
@@ -480,6 +558,7 @@ fn show_no_signal_confirm(
         on_response(resp.as_str() == "ok");
     });
 }
+
 
 /// Record a "no signal" measurement at a position and update the UI.
 /// `scan_list` is the (possibly empty) list of networks detected in range
@@ -592,6 +671,42 @@ fn independent_project_copy(project: &Project, drawings_dir: &std::path::Path) -
 
 /// Replace the in-memory project and refresh every UI element to match it.
 /// Returns the project name.
+/// Remember a project file as the last opened one and push it to the
+/// front of the recent list (deduped, capped at 10). Persists the settings.
+fn remember_project_path(path: &std::path::Path, settings: &Rc<RefCell<AppSettings>>) {
+    let p = path.to_string_lossy().to_string();
+    let mut s = settings.borrow_mut();
+    s.last_project_path = Some(p.clone());
+    s.recent_projects.retain(|r| *r != p);
+    s.recent_projects.insert(0, p);
+    s.recent_projects.truncate(10);
+    let _ = SettingsStore::save(&s);
+}
+
+/// (Re)build the project menu: the base actions plus a "Recent Projects"
+/// section from the settings (most recent first, file names only).
+fn rebuild_project_menu(menu: &gtk4::gio::Menu, settings: &Rc<RefCell<AppSettings>>) {
+    menu.remove_all();
+    let base = gtk4::gio::Menu::new();
+    base.append(Some("New Project"), Some("win.new-project"));
+    base.append(Some("Open Project…"), Some("win.open-project"));
+    base.append(Some("Save Project As…"), Some("win.save-project-as"));
+    menu.append_section(Some("Project"), &base);
+
+    let recents = settings.borrow().recent_projects.clone();
+    if !recents.is_empty() {
+        let rec = gtk4::gio::Menu::new();
+        for (i, path) in recents.iter().enumerate() {
+            let label = std::path::Path::new(path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.clone());
+            rec.append(Some(&label), Some(&format!("win.open-recent::{i}")));
+        }
+        menu.append_section(Some("Recent Projects"), &rec);
+    }
+}
+
 fn apply_project(
     state: &Rc<RefCell<AppState>>,
     fp: &FloorPlanView,
@@ -623,6 +738,7 @@ fn apply_project(
     };
 
     settings.borrow_mut().last_floor_index = 0;
+    remember_project_path(&project_path, settings);
     let _ = SettingsStore::save(&settings.borrow());
 
     // Rebuild the floor dropdown without triggering selected_notify side-effects
@@ -653,11 +769,9 @@ fn build_ui(
     let header = HeaderBar::new();
 
     // Project menu (hamburger). Actions are wired up further down, once all
-    // the widgets they touch exist.
+    // the widgets they touch exist. Rebuilt whenever the recent list changes.
     let project_menu = gtk4::gio::Menu::new();
-    project_menu.append(Some("New Project"), Some("win.new-project"));
-    project_menu.append(Some("Open Project…"), Some("win.open-project"));
-    project_menu.append(Some("Save Project As…"), Some("win.save-project-as"));
+    rebuild_project_menu(&project_menu, &settings);
     let menu_btn = MenuButton::new();
     menu_btn.set_icon_name("open-menu-symbolic");
     menu_btn.set_tooltip_text(Some("Project: new / open / save as"));
@@ -694,6 +808,12 @@ fn build_ui(
         "Known APs: access points seen in this project — set alias names",
     ));
     header.pack_start(&known_aps_btn);
+
+    let channel_report_btn = Button::with_label("Channel report");
+    channel_report_btn.set_tooltip_text(Some(
+        "Channel report: channel / AP / signal per measurement point and across the site survey",
+    ));
+    header.pack_start(&channel_report_btn);
 
     let heatmap_toggle = ToggleButton::new();
     heatmap_toggle.set_icon_name("view-grid-symbolic");
@@ -912,19 +1032,45 @@ fn build_ui(
 
     body.set_start_child(Some(&fp_col));
     body.set_end_child(Some(&sidebar));
-    // One-shot: once the paned has a size, give the sidebar its requested width.
-    // The divider is draggable afterwards to resize either side.
+    // One-shot: once the paned has a size, give the sidebar its remembered
+    // (or default) width. The divider is draggable afterwards to resize
+    // either side.
     {
         let body_init = body.clone();
+        let settings_init = settings.clone();
         let _ = glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
             let total = body_init.width();
             if total > 0 {
-                body_init.set_position((total - 290).max(100));
+                let sidebar = {
+                    let s = settings_init.borrow();
+                    if s.sidebar_width >= 180 { s.sidebar_width } else { 290 }
+                };
+                body_init.set_position((total - sidebar).max(100));
                 glib::ControlFlow::Break
             } else {
                 glib::ControlFlow::Continue
             }
         });
+
+        // Remember window size + sidebar width across sessions: debounced
+        // saves on resize/pane-drag, plus one immediate save on close.
+        let ui_sched = Rc::new(RefCell::new(None::<glib::SourceId>));
+        {
+            let (w, b, s, c) = (window.clone(), body.clone(), settings.clone(), ui_sched.clone());
+            window.connect_notify_local(Some("width"), move |_, _| remember_ui_geometry(&w, &b, s.clone(), c.clone()));
+        }
+        {
+            let (w, b, s, c) = (window.clone(), body.clone(), settings.clone(), ui_sched.clone());
+            window.connect_notify_local(Some("height"), move |_, _| remember_ui_geometry(&w, &b, s.clone(), c.clone()));
+        }
+        {
+            let (w, b, s, c) = (window.clone(), body.clone(), settings.clone(), ui_sched.clone());
+            body.connect_notify_local(Some("position"), move |_, _| remember_ui_geometry(&w, &b, s.clone(), c.clone()));
+        }
+        {
+            let (w, b, s) = (window.clone(), body.clone(), settings.clone());
+            window.connect_destroy(move |_| save_ui_geometry_now(&w, &b, &s));
+        }
     }
     main_box.append(&body);
     overlay.set_child(Some(&main_box));
@@ -1129,8 +1275,8 @@ fn build_ui(
                     .as_ref()
                     .map(|w| w.device.clone())
                     .or_else(|| scan_list.first().map(|e| e.device.clone()));
-                if let Some(dev) = nl_device {
-                    if let Some(ic) = nl80211::interface_channel(&dev) {
+                if let Some(dev) = nl_device.as_deref() {
+                    if let Some(ic) = nl80211::interface_channel(dev) {
                         if let Some(w) = wifi.as_mut() {
                             w.channel_width_mhz = ic.channel.width_mhz;
                             w.center_freq_mhz = ic.channel.center_freq_mhz;
@@ -1161,7 +1307,9 @@ fn build_ui(
                     (None, None)
                 };
 
-                tx.send_blocking(MeasureResult { rx, ry, wifi, scan_list, iperf_mbps, iperf_error, smb_mbps, smb_error }).ok();
+                tx.send_blocking(MeasureResult {
+                    rx, ry, wifi, scan_list, iperf_mbps, iperf_error, smb_mbps, smb_error,
+                }).ok();
             });
 
             let state2 = state.clone();
@@ -1406,14 +1554,18 @@ fn build_ui(
     }
 
     // Measurement selection: two-way correlation between map and list
+    // (also kept in sync with the open Channel Report window).
+    let report_ref: Rc<RefCell<Option<gtk4::Window>>> = Rc::new(RefCell::new(None));
     {
         let panel = panel.clone();
         let legend = legend.clone();
         let state = state.clone();
+        let report_ref = report_ref.clone();
         floor_plan.set_on_select_measurement(move |id| {
             let sel = id.as_ref().and_then(|id| find_measurement(&state, id));
             legend.set_selected_measurement(sel);
-            panel.set_selected_by_id(id);
+            panel.set_selected_by_id(id.clone());
+            notify_channel_report(&report_ref, id);
         });
     }
     {
@@ -1422,10 +1574,12 @@ fn build_ui(
         let panel_cb = panel.clone();
         let legend = legend.clone();
         let state = state.clone();
+        let report_ref = report_ref.clone();
         panel.set_on_row_clicked(move |id| {
             fp.set_selected_measurement(Some(id.clone()));
             legend.set_selected_measurement(find_measurement(&state, &id));
-            panel_cb.set_selected_by_id(Some(id));
+            panel_cb.set_selected_by_id(Some(id.clone()));
+            notify_channel_report(&report_ref, Some(id));
         });
     }
     // Remember the chosen WiFi card when the user switches it in the selector.
@@ -2016,6 +2170,52 @@ fn build_ui(
         });
     }
 
+    // Channel report (per-point + site-survey views of recorded scans).
+    // Non-modal; shares the floor-plan measurement selection with the
+    // main window.
+    {
+        let window_ref = window.clone();
+        let state2 = state.clone();
+        let fp = floor_plan.clone();
+        let panel = panel.clone();
+        let legend = legend.clone();
+        let report_ref = report_ref.clone();
+        channel_report_btn.connect_clicked(move |_| {
+            let (floor_name, measurements, aliases) = {
+                let s = state2.borrow();
+                let floor = &s.project.floors[s.current_floor];
+                (
+                    floor.name.clone(),
+                    floor.measurements.clone(),
+                    s.project.bssid_aliases.clone(),
+                )
+            };
+            let fp2 = fp.clone();
+            let legend2 = legend.clone();
+            let panel2 = panel.clone();
+            let state2c = Rc::clone(&state2);
+            let on_select: Box<dyn Fn(Option<String>)> = Box::new(move |id: Option<String>| {
+                if let Some(id) = id {
+                    fp2.set_selected_measurement(Some(id.clone()));
+                    legend2.set_selected_measurement(find_measurement(&state2c, &id));
+                    panel2.set_selected_by_id(Some(id));
+                }
+            });
+            let win = crate::widgets::channel_report::show_channel_report(
+                &window_ref,
+                &floor_name,
+                measurements,
+                aliases,
+                on_select,
+            );
+            let rr = report_ref.clone();
+            *report_ref.borrow_mut() = Some(win.clone());
+            win.connect_destroy(move |_| {
+                rr.borrow_mut().take();
+            });
+        });
+    }
+
     // ── Project menu actions ────────────────────────────────────────────────
     {
         let win_actions = gtk4::gio::SimpleActionGroup::new();
@@ -2035,6 +2235,7 @@ fn build_ui(
             let overlay_ref = overlay.clone();
             let window_ref2 = window_ref.clone();
             let rebuild_source_dd = rebuild_source_dd.clone();
+            let project_menu2 = project_menu.clone();
             act_new.connect_activate(move |_, _| {
                 let dialog = MessageDialog::builder()
                     .heading("Start New Project")
@@ -2059,6 +2260,7 @@ fn build_ui(
                 let overlay2 = overlay_ref.clone();
                 let window_ref3 = window_ref2.clone();
                 let rebuild2 = rebuild_source_dd.clone();
+                let project_menu3 = project_menu2.clone();
                 dialog.choose(gtk4::gio::Cancellable::NONE, move |response| {
                     if response.as_str() != "new" { return; }
                     // The current project stays saved at its current path
@@ -2071,6 +2273,7 @@ fn build_ui(
                     );
                     window_ref3.set_title(Some(&format!("{name} — WiFi Checker")));
                     overlay2.add_toast(Toast::new("New project started"));
+                    rebuild_project_menu(&project_menu3, &settings2);
                 });
             });
         }
@@ -2090,6 +2293,7 @@ fn build_ui(
             let overlay_ref = overlay.clone();
             let window_ref2 = window_ref.clone();
             let rebuild_source_dd = rebuild_source_dd.clone();
+            let project_menu2 = project_menu.clone();
             act_open.connect_activate(move |_, _| {
                 let dialog = FileDialog::builder().title("Open Project").modal(true).build();
                 let filter = gtk4::FileFilter::new();
@@ -2111,6 +2315,7 @@ fn build_ui(
                 let window_ref3 = window_ref2.clone();
                 let dialog_parent = window_ref2.clone();
                 let rebuild2 = rebuild_source_dd.clone();
+                let project_menu3 = project_menu2.clone();
                 dialog.open(Some(&dialog_parent), gtk4::gio::Cancellable::NONE, move |result| {
                     let Ok(file) = result else { return; };
                     let Some(path) = file.path() else { return; };
@@ -2131,10 +2336,55 @@ fn build_ui(
                     );
                     window_ref3.set_title(Some(&format!("{name} — WiFi Checker")));
                     overlay2.add_toast(Toast::new(&format!("Opened: {name}")));
+                    rebuild_project_menu(&project_menu3, &settings2);
                 });
             });
         }
         ActionMapExt::add_action(&win_actions, &act_open);
+
+        // Open a recent project by index into the settings' recent list.
+        let act_recent = gtk4::gio::SimpleAction::new("open-recent", Some(&glib::VariantTy::STRING));
+        {
+            let state = state.clone();
+            let fp = floor_plan.clone();
+            let legend = legend.clone();
+            let panel = panel.clone();
+            let floor_model = floor_model.clone();
+            let floor_dd = floor_dropdown.clone();
+            let suppress = suppress_floor_change.clone();
+            let settings = settings.clone();
+            let overlay_ref = overlay.clone();
+            let window_ref2 = window_ref.clone();
+            let rebuild_source_dd = rebuild_source_dd.clone();
+            let project_menu2 = project_menu.clone();
+            act_recent.connect_activate(move |_action, param| {
+                let Some(idx) = param
+                    .and_then(|p| p.str())
+                    .and_then(|s| s.parse::<usize>().ok())
+                else { return };
+                let Some(path_str) = settings.borrow().recent_projects.get(idx).cloned() else {
+                    overlay_ref.add_toast(Toast::new("This project is no longer in the recent list"));
+                    return;
+                };
+                let path = std::path::PathBuf::from(path_str);
+                let project = match JsonStore::load(&path) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        overlay_ref.add_toast(Toast::new(&format!("Failed to open project: {e}")));
+                        return;
+                    }
+                };
+                auto_save(&fp, &state);
+                let name = apply_project(
+                    &state, &fp, &legend, &panel, &floor_model, &floor_dd, &suppress, &settings, &rebuild_source_dd,
+                    project, path,
+                );
+                window_ref2.set_title(Some(&format!("{name} — WiFi Checker")));
+                overlay_ref.add_toast(Toast::new(&format!("Opened: {name}")));
+                rebuild_project_menu(&project_menu2, &settings);
+            });
+        }
+        ActionMapExt::add_action(&win_actions, &act_recent);
 
         // Save project as: write the project (with its drawings) to a new file
         // and switch auto-save to that location
@@ -2142,6 +2392,8 @@ fn build_ui(
         {
             let state = state.clone();
             let fp = floor_plan.clone();
+            let settings = settings.clone();
+            let project_menu2 = project_menu.clone();
             let overlay_ref = overlay.clone();
             let window_ref2 = window_ref.clone();
             act_save.connect_activate(move |_, _| {
@@ -2155,6 +2407,8 @@ fn build_ui(
 
                 let state2 = state.clone();
                 let fp2 = fp.clone();
+                let settings2 = settings.clone();
+                let project_menu3 = project_menu2.clone();
                 let overlay2 = overlay_ref.clone();
                 let dialog_parent = window_ref2.clone();
                 dialog.save(Some(&dialog_parent), gtk4::gio::Cancellable::NONE, move |result| {
@@ -2176,6 +2430,8 @@ fn build_ui(
                             // From now on auto-save goes to the new location
                             state2.borrow_mut().project_path = path.clone();
                             auto_save(&fp2, &state2);
+                            remember_project_path(&path, &settings2);
+                            rebuild_project_menu(&project_menu3, &settings2);
                             overlay2.add_toast(Toast::new(&format!("Project saved to {}", path.display())));
                         }
                         Err(e) => {

@@ -623,7 +623,7 @@ impl MeasurementPanel {
             // "No connection" when APs were in range at the point, "No
             // signal" when the scan found nothing (true dead zone).
             let label = if m.scan_results.is_empty() { "No signal" } else { "No connection" };
-            format!("⚫ {label} | {}", m.timestamp.format("%H:%M:%S"))
+            format!("⚫ {label} | {}", m.timestamp.with_timezone(&chrono::Local).format("%H:%M:%S"))
         } else {
             let source = self.signal_source.borrow();
             // The dBm shown follows the active signal source; "—" means the
@@ -632,7 +632,7 @@ impl MeasurementPanel {
             let mut s = format!(
                 "{} | {} | {}",
                 m.ssid, dbm_str,
-                m.timestamp.format("%H:%M:%S")
+                m.timestamp.with_timezone(&chrono::Local).format("%H:%M:%S")
             );
             if let Some(mbps) = m.iperf_mbps {
                 s.push_str(&format!(" | ⚡{}", self.unit.borrow().format_short(mbps)));
@@ -822,7 +822,7 @@ fn format_measurement_details(m: &Measurement, unit: &ThroughputUnit, source: &S
         let mut text = format!(
             "{}\nTime: {}",
             head,
-            m.timestamp.format("%m-%d %H:%M:%S")
+            m.timestamp.with_timezone(&chrono::Local).format("%m-%d %H:%M:%S")
         );
         if !m.scan_results.is_empty() {
             text.push_str(&format!("\nNetworks in range: {}", m.scan_results.len()));
@@ -860,7 +860,7 @@ fn format_measurement_details(m: &Measurement, unit: &ThroughputUnit, source: &S
     let mut text = format!(
         "SSID: {}\nBSSID: {}\nSignal: {} dBm ({})\nBand: {} | Ch: {} | {} MHz{}\nTime: {}",
         m.ssid, bssid_label, m.signal_dbm, signal_quality_str(m.signal_dbm), band, m.channel, m.frequency_mhz, ch_suffix,
-        m.timestamp.format("%m-%d %H:%M:%S")
+        m.timestamp.with_timezone(&chrono::Local).format("%m-%d %H:%M:%S")
     );
     // When a non-default signal source is active, show the filtered value too.
     if !source.is_connected_ap() {

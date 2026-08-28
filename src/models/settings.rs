@@ -72,6 +72,15 @@ pub struct AppSettings {
 
     // UI state
     pub last_floor_index: usize,
+    /// Remembered main window size in px (0 = use built-in default).
+    pub window_width: i32,
+    pub window_height: i32,
+    /// Remembered measurement-panel (sidebar) width in px (0 = default).
+    pub sidebar_width: i32,
+    /// File of the last opened project — restored on startup.
+    pub last_project_path: Option<String>,
+    /// Recently opened projects, most recent first (capped at 10).
+    pub recent_projects: Vec<String>,
 }
 
 impl Default for AppSettings {
@@ -103,6 +112,11 @@ impl Default for AppSettings {
             wifi_device: None,
 
             last_floor_index: 0,
+            window_width: 0,
+            window_height: 0,
+            sidebar_width: 0,
+            last_project_path: None,
+            recent_projects: Vec::new(),
         }
     }
 }

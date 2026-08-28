@@ -1,3 +1,4 @@
+pub mod channel_report;
 pub mod floor_plan_view;
 pub mod legend_bar;
 pub mod measurement_panel;

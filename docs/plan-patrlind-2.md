@@ -123,12 +123,88 @@ No fallback to `iw` — if netlink is unavailable, fields simply stay unknown.
 
 ## Verification plan (results 2026-08-28)
 
-- ✅ `cargo test` — **155 tests pass** (incl. IE-decoding unit tests with synthetic vectors, backward-compat deserialization test, and the live netlink test gated behind `WIFICHECKER_LIVE_DBUS=1`)
+- ✅ `cargo test` — **167 tests pass** (incl. IE-decoding unit tests with synthetic vectors, backward-compat deserialization test, and the live netlink test gated behind `WIFICHECKER_LIVE_DBUS=1`)
 - ✅ Native live run on this machine (40 MHz ch36/ch38 connection): interface query and scan-cache enrichment **both** report `5180 MHz / 40 MHz / center 5190 MHz` for the connected AP — matching `iw dev wlp14s0 link` / `iw scan dump`
 - ⏳ Disconnect WiFi → measure a no-signal point → confirm scan list + wanted-SSID reporting (needs the user's network toggle — left as a manual step; code path reuses the same verified `scan_channels()`)
 - ✅ Flatpak sandbox AF_NETLINK — **confirmed via flatpak 1.16.6 source** (`socket_family_allowlist` in `common/flatpak-run.c`); sandbox also shares the host netns, so no further probe needed
 - ✅ Load an old project file — covered by unit test `test_measurement_json_without_new_fields_uses_defaults`
 - ✅ Version bump `0.2.2-patrlind-1` → `0.2.2-patrlind-2` (`VERSION` + `Cargo.toml`, `build.rs` sync check passes)
+
+## Part 2b: channel width/center for all scanned APs (2026-08-28)
+
+### Empirical findings (dev machine, iwlwifi, kernel 7.0)
+
+| Path | Privilege | Result |
+|------|-----------|--------|
+| `GET_INTERFACE` (connected AP) | none | width/center of the associated BSS |
+| `GET_SCAN` (driver scan cache) | none | **full AP list** (67–98 BSS with width/center) right after any scan completes; shrinks to just the associated BSS while the connection sits idle |
+| Trigger own scan (`NL80211_CMD_SCAN`) | CAP_NET_ADMIN | accepted with privilege; per-BSS results unicast to the triggering socket only |
+
+The app already triggers an NM scan (`request_fresh_scan`, the same
+unprivileged D-Bus call `nmcli device wifi rescan` uses) right before the
+scan list is recorded, so `scan_channels()` (GET_SCAN) read immediately
+afterwards sees the full, fresh cache. **No privilege is needed at all.**
+
+### Root cause of the originally all-null records
+
+`merge_nl_scan` never matched: NM reports BSSIDs **uppercase**
+(`B4:FB:E4:12:14:FA`), netlink keys them **lowercase**. Fixed with a
+case-insensitive lookup — that single fix made the full width/center data
+appear in the saved scan lists.
+
+### What was tried and removed
+
+A privileged own-scan enrichment (`trigger_scan_channels` + `setcap`
+capability + one-time hint dialog) was implemented and then found to be
+unnecessary (the cache is already fresh at read time) and its
+`NEW_SCAN_RESULTS` event collection was unreliable. **Removed:** the
+trigger code, the `setcap` dialog, and the related `MeasureResult` flags.
+
+### Chart rework (same step)
+- Bar placement = physical spectrum: centered on the recorded center
+  frequency (40 MHz @ 5180/center 5190 → 5170–5210), derived from base
+  frequency when unknown; 80+80 → two 80 MHz lobes (`bar_lobes()`,
+  unit-tested).
+- Bar color = **signal strength** (green → yellow → orange → red,
+  `signal_color()`); table dots match.
+- Spotlight highlight: hovering a bar or a table row dims all other
+  bars (alpha 0.15), draws a black triangle marker under the
+  highlighted bar's channel (drawn last, always on top), and highlights
+  the matching row (shared `BandSync` hover state; CSS in `main.rs`).
+- Tables sorted **strongest signal first**; dedicated BSSID column
+  (dot + MAC) + separate AP (alias) column.
+- `merge_nl_scan` matches BSSIDs case-insensitively.
+
+## Part 2c: remembered UI + last/recent projects (2026-08-28)
+
+- **Window size + measurement-panel width** remembered in `settings.json`
+  (`window_width/height`, `sidebar_width`); debounced save on
+  resize/pane-drag + immediate save on window close; restored on start
+  (`save_ui_geometry_now` / `remember_ui_geometry`).
+- **Start with the last opened project** instead of the default project
+  (`last_project_path`, restored in `Window::new`, falls back to the
+  default project file).
+- **Recent Projects** section in the hamburger menu (up to 10, file
+  names, most recent first; `recent_projects`). Updated on new/open/
+  save-as/open-recent via `remember_project_path`; menu rebuilt in place
+  via `rebuild_project_menu` (same `gio::Menu` object, so the
+  MenuButton picks up changes without re-setting the model).
+
+## Risks / open items
+## Part 2c: remembered UI + last/recent projects (2026-08-28)
+
+- **Window size + measurement-panel width** remembered in `settings.json`
+  (`window_width/height`, `sidebar_width`); debounced save on
+  resize/pane-drag + immediate save on window close; restored on start
+  (`save_ui_geometry_now` / `remember_ui_geometry`).
+- **Start with the last opened project** instead of the default project
+  (`last_project_path`, restored in `Window::new`, falls back to the
+  default project file).
+- **Recent Projects** section in the hamburger menu (up to 10, file
+  names, most recent first; `recent_projects`). Updated on new/open/
+  save-as/open-recent via `remember_project_path`; menu rebuilt in place
+  via `rebuild_project_menu` (same `gio::Menu` object, so the
+  MenuButton picks up changes without re-setting the model).
 
 ## Risks / open items
 
@@ -153,4 +229,15 @@ No fallback to `iw` — if netlink is unavailable, fields simply stay unknown.
 
 **Part 2**
 - new: `src/widgets/channel_report.rs`
-- `src/window.rs` (button + wiring)
+**Part 2b**
+- `src/services/nl80211.rs` (`bss_channel_info` refactor, cache docs;
+  privileged trigger code tried and removed)
+- `src/window.rs` (case-insensitive `merge_nl_scan`)
+- `src/widgets/channel_report.rs` (`bar_lobes`, `signal_color`,
+  `BandSync`, spotlight/marker drawing, signal-sorted tables)
+- `src/main.rs` (row-hover CSS)
+
+**Part 2c**
+- `src/models/settings.rs` (window/sidebar size, last + recent projects)
+- `src/window.rs` (startup project restore, `remember_project_path`,
+  `rebuild_project_menu`, `open-recent` action, geometry save)

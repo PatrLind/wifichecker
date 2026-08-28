@@ -148,6 +148,13 @@ pub fn interface_channel(ifname: &str) -> Option<InterfaceChannel> {
 /// Reads the driver's scan cache (no new scan is triggered). Width/center
 /// are derived from the BSS information elements; a BSS with IEs but no
 /// HT/VHT/HE/EHT operation element is a 20 MHz BSS (center = primary).
+///
+/// The cache holds the results of the **last completed scan** on the
+/// wiphy and shrinks to just the associated BSS while the connection sits
+/// idle. The app triggers an NM scan (`request_fresh_scan`, the same
+/// unprivileged path `nmcli device wifi rescan` uses) right before the
+/// scan list is recorded, so reading here right afterwards yields the
+/// full AP list with width/center — no privilege needed.
 pub fn scan_channels(ifindex: u32) -> ScanChannels {
     with_netlink(move |handle| {
         Box::pin(async move {
@@ -160,53 +167,55 @@ pub fn scan_channels(ifindex: u32) -> ScanChannels {
                 .map_err(|e| format!("scan dump: {e}"))?
             {
                 for a in &msg.payload.attributes {
-                    // One BSS per message: a flat list of BSS attributes.
-                    let Nl80211Attr::Bss(attrs) = a else { continue };
-                    let mut bssid: Option<[u8; 6]> = None;
-                    let mut freq: Option<u32> = None;
-                    // Beacon IEs first (most stable), then last-frame IEs.
-                    let mut ie_lists: Vec<&Vec<u8>> = Vec::new();
-                    for b in attrs {
-                        match b {
-                            Nl80211BssInfo::Bssid(m) => bssid = Some(*m),
-                            Nl80211BssInfo::Frequency(f) => freq = Some(*f),
-                            Nl80211BssInfo::RawBeaconInformationElements(v) => {
-                                ie_lists.insert(0, v)
-                            }
-                            Nl80211BssInfo::RawInformationElements(v) => {
-                                ie_lists.push(v)
-                            }
-                            _ => {}
+                    if let Nl80211Attr::Bss(attrs) = a {
+                        if let Some((bssid, ch)) = bss_channel_info(attrs) {
+                            out.insert(bssid, ch);
                         }
                     }
-                    let Some(mac) = bssid else { continue };
-                    let mut ch = ChannelInfo {
-                        primary_freq_mhz: freq,
-                        ..Default::default()
-                    };
-                    if !ie_lists.is_empty() {
-                        // Use the first IE list that yields channel info.
-                        if let Some((width, c1, c2)) =
-                            ie_lists.iter().find_map(|ies| ie_width_center(ies, freq))
-                        {
-                            ch.width_mhz = Some(width);
-                            ch.center_freq_mhz = c1;
-                            ch.center_freq2_mhz = c2;
-                        } else {
-                            // IEs present but no operation element → 20 MHz.
-                            ch.width_mhz = Some(20);
-                        }
-                    }
-                    if ch.width_mhz == Some(20) {
-                        ch.center_freq_mhz = ch.center_freq_mhz.or(freq);
-                    }
-                    out.insert(bssid_to_str(&mac), ch);
                 }
             }
             Ok(out)
         })
     })
     .unwrap_or_default()
+}
+
+/// Decode one BSS attribute into (bssid, channel info). Returns `None`
+/// when the BSSID is missing.
+fn bss_channel_info(attrs: &[Nl80211BssInfo]) -> Option<(String, ChannelInfo)> {
+    let mut bssid: Option<[u8; 6]> = None;
+    let mut freq: Option<u32> = None;
+    // Beacon IEs first (most stable), then last-frame IEs.
+    let mut ie_lists: Vec<&Vec<u8>> = Vec::new();
+    for b in attrs {
+        match b {
+            Nl80211BssInfo::Bssid(m) => bssid = Some(*m),
+            Nl80211BssInfo::Frequency(f) => freq = Some(*f),
+            Nl80211BssInfo::RawBeaconInformationElements(v) => { ie_lists.insert(0, v) }
+            Nl80211BssInfo::RawInformationElements(v) => { ie_lists.push(v) }
+            _ => {}
+        }
+    }
+    let mac = bssid?;
+    let mut ch = ChannelInfo {
+        primary_freq_mhz: freq,
+        ..Default::default()
+    };
+    if !ie_lists.is_empty() {
+        // Use the first IE list that yields channel info.
+        if let Some((width, c1, c2)) = ie_lists.iter().find_map(|ies| ie_width_center(ies, freq)) {
+            ch.width_mhz = Some(width);
+            ch.center_freq_mhz = c1;
+            ch.center_freq2_mhz = c2;
+        } else {
+            // IEs present but no operation element → 20 MHz.
+            ch.width_mhz = Some(20);
+        }
+    }
+    if ch.width_mhz == Some(20) {
+        ch.center_freq_mhz = ch.center_freq_mhz.or(freq);
+    }
+    Some((bssid_to_str(&mac), ch))
 }
 
 // ── IE operation-element decoding ──────────────────────────────────────────
